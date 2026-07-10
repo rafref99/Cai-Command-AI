@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package and development tools
+        run: python -m pip install -e '.[dev]'
+      - name: Lint
+        run: python -m ruff check cai tests
+      - name: Type check
+        run: python -m mypy cai tests
+      - name: Compile
+        run: python -m compileall cai tests
+      - name: Test
+        run: python -m unittest
+      - name: Console script smoke test
+        run: cai --help

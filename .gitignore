@@ -1,0 +1,46 @@
+# Operating systems
+.DS_Store
+Thumbs.db
+
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging output
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Local configuration, logs, and snapshots
+.env
+.env.*
+!.env.example
+*.log
+.cai/
+.cai-snapshots/
+
+# Local model weights
+*.gguf
+*.safetensors
+*.onnx
