@@ -7,6 +7,9 @@ shell access inside a controlled workspace.
 > Cai is alpha software. Review requested actions and keep important work under
 > version control.
 
+![preview](./preview.png)
+
+
 ## Features
 
 - Interactive sessions with `cai chat` and scriptable one-shot tasks with
