@@ -7,7 +7,9 @@ Describe the problem and the approach taken.
 - [ ] Unit or integration tests added or updated where needed
 - [ ] `python3 -m ruff check cai tests`
 - [ ] `python3 -m mypy cai tests`
+- [ ] `python3 -m compileall -q cai tests`
 - [ ] `python3 -m unittest`
+- [ ] `cai --help`
 - [ ] Documentation updated for user-facing changes
 
 ## Risk

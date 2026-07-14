@@ -1,0 +1,25 @@
+Cai 0.0.0
+  demo-model | fake-provider
+  /workspace/demo | demo
+  /help for commands
+
+  * Thinking
+  + Read     src/app.py  12ms
+  + Read     2 operations | src/app.py -> tests/test_app.py  21ms
+  + Edit     src/app.py  21ms
+  * Working
+Workspace changes
+Status
+ M src/app.py
+
+Diff (+1 -1)
+diff --git a/src/app.py b/src/app.py
+--- a/src/app.py
++++ b/src/app.py
+@@ -1 +1 @@
+-print('old')
++print('ready')
+  + Done     184ms | 1,240 in / 186 out tokens
+
+Answer
+Updated `src/app.py` and verified the focused test.

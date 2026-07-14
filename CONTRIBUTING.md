@@ -22,7 +22,7 @@ python3 -m ruff check cai tests
 python3 -m mypy cai tests
 python3 -m compileall -q cai tests
 python3 -m unittest
-cai --help >/dev/null
+cai --help
 ```
 
 Changes to tools, provider parsing, approvals, or workspace boundaries should
@@ -37,6 +37,8 @@ applicable.
 - Never place API keys, model files, transcripts with secrets, or local
   configuration in commits.
 - Prefer focused changes over unrelated refactoring.
+- Keep prompts and tool schemas in sync; changes to either or to context budgets
+  require parity and bounded-context regression tests.
 - Update the README, operating guide, or feature reference when user-facing
   behavior changes.
 

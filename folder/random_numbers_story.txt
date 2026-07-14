@@ -1,0 +1,5 @@
+The Illusion of Chance
+
+In the cold, logical heart of the machine lived randomness—or rather, its perfect imitation. Computer random numbers are not truly random; they are meticulously calculated sequences derived from complex algorithms, often seeded by a tiny initial value (the seed). They are deterministic, predictable if you know the starting point.
+
+Yet, to the user, they appear magical, capable of predicting lottery winners or simulating natural chaos. The story of randomness in computing is thus a tale of elegant deception: a mathematical illusion so convincing that it passes for pure chance.

@@ -6,6 +6,7 @@ import shlex
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -14,7 +15,99 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from .config import RAW_API_KEY_PREFIX, api_key_setting_is_raw, decode_api_key_setting
+from .processes import process_group_popen_kwargs, terminate_process_tree
+
 Message = dict[str, Any]
+
+_RUNNER_LOG_READ_BYTES = 4_096
+_RUNNER_LOG_TAIL_BYTES = 16_384
+_RUNNER_LOG_JOIN_SECONDS = 1.0
+
+_NATIVE_TOOL_PRIORITY = (
+    "list_files",
+    "search",
+    "read_file",
+    "replace_text",
+    "write_file",
+    "run_shell",
+)
+
+
+@dataclass(frozen=True)
+class NativeToolCall:
+    """A provider-native function call with decoded arguments when valid."""
+
+    id: str
+    name: str
+    raw_arguments: str
+    arguments: dict[str, Any] | None
+    parse_error: str | None = None
+
+    def to_message_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "arguments": self.raw_arguments,
+            },
+        }
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+            total_tokens=self.total_tokens + other.total_tokens,
+        )
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+class ModelResponse(str):
+    """Assistant text plus structured metadata from a native tool response.
+
+    This is a ``str`` subclass so existing text-only clients and callers remain
+    compatible while native-aware agent loops can consume ``tool_calls`` and
+    ``assistant_message`` without reparsing synthetic text blocks.
+    """
+
+    tool_calls: tuple[NativeToolCall, ...]
+    usage: TokenUsage
+
+    def __new__(
+        cls,
+        content: str = "",
+        *,
+        tool_calls: Sequence[NativeToolCall] = (),
+        usage: TokenUsage | None = None,
+    ) -> ModelResponse:
+        response = super().__new__(cls, content)
+        response.tool_calls = tuple(tool_calls)
+        response.usage = usage or TokenUsage()
+        return response
+
+    @property
+    def assistant_message(self) -> Message:
+        message: Message = {
+            "role": "assistant",
+            "content": str(self) or (None if self.tool_calls else ""),
+        }
+        if self.tool_calls:
+            message["tool_calls"] = [call.to_message_dict() for call in self.tool_calls]
+        return message
 
 
 NATIVE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
@@ -22,7 +115,7 @@ NATIVE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "list_files",
-            "description": "List workspace files.",
+            "description": "Orient in the workspace without reading file contents.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -36,14 +129,16 @@ NATIVE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file with line numbers.",
+            "description": (
+                "Read one bounded page of a text file with line numbers. "
+                "Follow next_start_line when the result is paginated."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "start_line": {"type": "integer", "default": 1},
                     "max_lines": {"type": "integer", "default": 240},
-                    "max_bytes": {"type": "integer", "default": 1_000_000},
                 },
                 "required": ["path"],
             },
@@ -140,7 +235,7 @@ NATIVE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replace_text",
-            "description": "Replace exact text in a file.",
+            "description": "Preferred tool for one small, exact edit to an existing file.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -157,13 +252,21 @@ NATIVE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "replace_lines",
-            "description": "Replace an inclusive 1-based line range in a text file.",
+            "description": (
+                "Replace an inclusive 1-based range after reading current line numbers. "
+                "Past-EOF ranges require to_eof=true."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "start_line": {"type": "integer"},
                     "end_line": {"type": "integer"},
+                    "to_eof": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Explicitly allow an end_line past EOF to stop at EOF.",
+                    },
                     "content": {"type": "string"},
                 },
                 "required": ["path", "start_line", "end_line", "content"],
@@ -257,14 +360,13 @@ NATIVE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "search",
-            "description": "Search files with a regular expression.",
+            "description": "Locate relevant files and lines with a regular expression.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {"type": "string"},
                     "path": {"type": "string", "default": "."},
                     "max_results": {"type": "integer", "default": 120},
-                    "max_file_bytes": {"type": "integer", "default": 1_000_000},
                 },
                 "required": ["pattern"],
             },
@@ -288,19 +390,36 @@ NATIVE_TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "run_shell",
-            "description": "Run a shell command in the workspace.",
+            "description": (
+                "Run a validation or other command not covered by a dedicated tool "
+                "in the workspace."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout_seconds": {"type": "integer", "default": 60},
-                    "max_output_chars": {"type": "integer", "default": 12_000},
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Optional; omit to use the configured bounded default.",
+                    },
                 },
                 "required": ["command"],
             },
         },
     },
 ]
+
+
+def _ordered_native_tool_definitions() -> list[dict[str, Any]]:
+    rank = {name: index for index, name in enumerate(_NATIVE_TOOL_PRIORITY)}
+    return sorted(
+        NATIVE_TOOL_DEFINITIONS,
+        key=lambda item: rank.get(
+            str(item.get("function", {}).get("name", "")),
+            len(rank),
+        ),
+    )
 
 
 class ModelClient(Protocol):
@@ -340,7 +459,7 @@ class OpenAICompatibleClient:
         self,
         messages: list[Message],
         on_delta: Callable[[str], None] | None = None,
-    ) -> str:
+    ) -> ModelResponse:
         if not self.model:
             raise ProviderError("No model configured. Pass --model or run `cai setup`.")
 
@@ -351,7 +470,7 @@ class OpenAICompatibleClient:
             "stream": on_delta is not None,
         }
         if self.native_tools:
-            payload["tools"] = NATIVE_TOOL_DEFINITIONS
+            payload["tools"] = _ordered_native_tool_definitions()
             payload["tool_choice"] = "auto"
         request = urllib.request.Request(
             f"{self.base_url}/chat/completions",
@@ -393,9 +512,10 @@ class OpenAICompatibleClient:
         self,
         response: Iterable[bytes],
         on_delta: Callable[[str], None],
-    ) -> str:
+    ) -> ModelResponse:
         chunks: list[str] = []
         tool_call_parts: dict[int, dict[str, Any]] = {}
+        usage = TokenUsage()
         for raw_line in response:
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line or not line.startswith("data:"):
@@ -407,6 +527,7 @@ class OpenAICompatibleClient:
                 payload = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            usage = _extract_usage(payload) or usage
             delta = _extract_choice_delta(payload)
             content = _content_text(delta.get("content", ""))
             if content:
@@ -414,10 +535,10 @@ class OpenAICompatibleClient:
                 on_delta(content)
             _merge_stream_tool_calls(tool_call_parts, delta.get("tool_calls"))
         text = "".join(chunks)
-        native_blocks = _native_tool_blocks(
+        native_calls = _parse_native_tool_calls(
             [tool_call_parts[index] for index in sorted(tool_call_parts)]
         )
-        return "\n".join(part for part in [text, native_blocks] if part)
+        return ModelResponse(text, tool_calls=native_calls, usage=usage)
 
 
 class CommandModelClient:
@@ -441,26 +562,40 @@ class CommandModelClient:
     ) -> str:
         payload = json.dumps({"model": self.model, "messages": messages})
         shell = isinstance(self.command, str)
+        process = subprocess.Popen(
+            self.command,
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=shell,
+            **process_group_popen_kwargs(),
+        )
         try:
-            proc = subprocess.run(
-                self.command,
-                input=payload,
-                text=True,
-                capture_output=True,
-                shell=shell,
-                timeout=self.timeout,
-                check=False,
-            )
+            stdout, stderr = process.communicate(payload, timeout=self.timeout)
         except subprocess.TimeoutExpired as exc:
-            detail = _timeout_detail(exc)
+            terminate_process_tree(process)
+            stdout, stderr = process.communicate()
+            timeout_error = subprocess.TimeoutExpired(
+                cmd=self.command,
+                timeout=self.timeout,
+                output=stdout,
+                stderr=stderr,
+            )
+            detail = _timeout_detail(timeout_error)
             raise ProviderError(
                 "Command provider timed out after "
                 f"{self.timeout} second(s): {_display_command(self.command)}{detail}"
             ) from exc
-        if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout).strip()
-            raise ProviderError(f"Command provider failed with exit {proc.returncode}: {detail}")
-        output = proc.stdout.strip()
+        except BaseException:
+            terminate_process_tree(process)
+            raise
+        if process.returncode != 0:
+            detail = (stderr or stdout).strip()
+            raise ProviderError(
+                f"Command provider failed with exit {process.returncode}: {detail}"
+            )
+        output = stdout.strip()
         if on_delta is not None and output:
             on_delta(output)
         return output
@@ -474,7 +609,10 @@ class LocalModelServer:
     startup_timeout: int = 60
 
     def __post_init__(self) -> None:
-        self.process: subprocess.Popen[str] | None = None
+        self.process: subprocess.Popen[bytes] | None = None
+        self._runner_log_tail = b""
+        self._runner_log_lock = threading.Lock()
+        self._runner_log_thread: threading.Thread | None = None
         self.port = self.port or _free_port()
         self.base_url = f"http://127.0.0.1:{self.port}/v1"
 
@@ -494,34 +632,102 @@ class LocalModelServer:
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
+            bufsize=0,
+            **process_group_popen_kwargs(),
         )
-        self._wait_until_ready(command)
+        try:
+            self._start_runner_log_drain()
+            self._wait_until_ready(command)
+        except BaseException:
+            self._stop_process()
+            raise
         return self
 
     def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
+        self._stop_process()
+
+    def _stop_process(self) -> None:
+        process = self.process
+        if process is None:
+            return
+        terminate_process_tree(
+            process,
+            terminate_timeout=10,
+            kill_timeout=5,
+        )
+
+        self._join_runner_log_drain()
+        if process.stdout:
             try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
-        if self.process and self.process.stdout:
-            self.process.stdout.close()
+                process.stdout.close()
+            except OSError:
+                pass
+        self._join_runner_log_drain(timeout=0.1)
+        self.process = None
+
+    def _start_runner_log_drain(self) -> None:
+        if self.process is None or self.process.stdout is None:
+            return
+        thread = threading.Thread(
+            target=self._drain_runner_log,
+            args=(self.process.stdout,),
+            name="cai-local-runner-log",
+            daemon=True,
+        )
+        self._runner_log_thread = thread
+        thread.start()
+
+    def _drain_runner_log(self, stream: Any) -> None:
+        try:
+            while True:
+                chunk = stream.read(_RUNNER_LOG_READ_BYTES)
+                if not chunk:
+                    return
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8", errors="replace")
+                self._append_runner_log(chunk)
+        except (OSError, ValueError):
+            return
+
+    def _append_runner_log(self, chunk: bytes) -> None:
+        with self._runner_log_lock:
+            self._runner_log_tail = (self._runner_log_tail + chunk)[
+                -_RUNNER_LOG_TAIL_BYTES:
+            ]
+
+    def _runner_log_text(self) -> str:
+        with self._runner_log_lock:
+            output = self._runner_log_tail
+        return output.decode("utf-8", errors="replace").strip()
+
+    def _join_runner_log_drain(self, timeout: float = _RUNNER_LOG_JOIN_SECONDS) -> None:
+        thread = self._runner_log_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(timeout=timeout)
+        if not thread.is_alive():
+            self._runner_log_thread = None
+
+    def _runner_log_diagnostic(self) -> str:
+        output = self._runner_log_text()
+        if not output:
+            return ""
+        return f"\nRunner output tail:\n{output}"
 
     def _wait_until_ready(self, command: str) -> None:
-        deadline = time.time() + self.startup_timeout
+        deadline = time.monotonic() + self.startup_timeout
         url = f"{self.base_url}/models"
         last_error = ""
-        while time.time() < deadline:
-            if self.process and self.process.poll() is not None:
-                output = ""
-                if self.process.stdout:
-                    output = self.process.stdout.read()
+        while time.monotonic() < deadline:
+            if self.process:
+                return_code = self.process.poll()
+            else:
+                return_code = None
+            if return_code is not None:
+                self._join_runner_log_drain()
                 raise ProviderError(
-                    "Local model runner exited before it became ready.\n"
-                    f"Command: {command}\n{output}"
+                    f"Local model runner exited with code {return_code} before it became ready.\n"
+                    f"Command: {command}{self._runner_log_diagnostic()}"
                 )
             try:
                 with urllib.request.urlopen(url, timeout=2) as response:
@@ -533,6 +739,7 @@ class LocalModelServer:
         raise ProviderError(
             "Timed out waiting for the local model server.\n"
             f"Command: {command}\nLast error: {last_error}"
+            f"{self._runner_log_diagnostic()}"
         )
 
 
@@ -550,9 +757,14 @@ def detect_runner_command() -> str:
     )
 
 
-def api_key_from_env(env_name: str) -> str:
-    if not env_name:
+def api_key_from_env(env_name: object) -> str:
+    if not isinstance(env_name, str) or not env_name:
         return ""
+    if env_name.startswith(RAW_API_KEY_PREFIX):
+        return env_name.removeprefix(RAW_API_KEY_PREFIX)
+    decoded = decode_api_key_setting(env_name)
+    if decoded != env_name:
+        return decoded
     value = os.environ.get(env_name)
     if value is not None:
         return value
@@ -561,27 +773,7 @@ def api_key_from_env(env_name: str) -> str:
     return ""
 
 
-def api_key_setting_is_raw(value: str) -> bool:
-    if not value:
-        return False
-    lowered = value.lower()
-    return (
-        not _is_valid_env_name(value)
-        or lowered.startswith(("sk-", "sk_", "lmstudio-", "lmstudio_"))
-        or ":" in value
-    )
-
-
-def _is_valid_env_name(value: str) -> bool:
-    if not value:
-        return False
-    first = value[0]
-    if not (first.isalpha() or first == "_"):
-        return False
-    return all(character.isalnum() or character == "_" for character in value)
-
-
-def _extract_chat_content(payload: Mapping[str, object]) -> str:
+def _extract_chat_content(payload: Mapping[str, object]) -> ModelResponse:
     try:
         choices = payload["choices"]  # type: ignore[index]
         first = choices[0]  # type: ignore[index]
@@ -591,16 +783,35 @@ def _extract_chat_content(payload: Mapping[str, object]) -> str:
     except (KeyError, IndexError, TypeError, AttributeError) as exc:
         raise ProviderError(f"Unexpected chat completion response: {payload}") from exc
     text = _content_text(content)
-    native_blocks = _native_tool_blocks(tool_calls)
-    if native_blocks:
-        return "\n".join(part for part in [text, native_blocks] if part)
-    return text
+    return ModelResponse(
+        text,
+        tool_calls=_parse_native_tool_calls(tool_calls),
+        usage=_extract_usage(payload),
+    )
 
 
-def _native_tool_blocks(tool_calls: object) -> str:
+def _extract_usage(payload: Mapping[str, object]) -> TokenUsage | None:
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        return None
+
+    def integer(*names: str) -> int:
+        for name in names:
+            value = usage.get(name)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                return value
+        return 0
+
+    input_tokens = integer("prompt_tokens", "input_tokens")
+    output_tokens = integer("completion_tokens", "output_tokens")
+    total_tokens = integer("total_tokens") or input_tokens + output_tokens
+    return TokenUsage(input_tokens, output_tokens, total_tokens)
+
+
+def _parse_native_tool_calls(tool_calls: object) -> tuple[NativeToolCall, ...]:
     if not isinstance(tool_calls, list):
-        return ""
-    blocks = []
+        return ()
+    parsed_calls: list[NativeToolCall] = []
     for call in tool_calls:
         if not isinstance(call, dict):
             continue
@@ -612,18 +823,36 @@ def _native_tool_blocks(tool_calls: object) -> str:
         if not isinstance(name, str):
             continue
         if not isinstance(raw_arguments, str):
-            raw_arguments = json.dumps(raw_arguments)
+            raw_arguments = json.dumps(raw_arguments, ensure_ascii=False)
+        arguments: dict[str, Any] | None = None
+        parse_error: str | None = None
         try:
-            arguments = json.loads(raw_arguments or "{}")
-        except json.JSONDecodeError:
-            payload = f'{{"name": {json.dumps(name)}, "arguments": {raw_arguments}}}'
-        else:
-            payload = json.dumps(
-                {"name": name, "arguments": arguments if isinstance(arguments, dict) else {}},
-                ensure_ascii=False,
+            decoded = json.loads(raw_arguments or "{}")
+        except json.JSONDecodeError as exc:
+            parse_error = (
+                f"arguments are not valid JSON: {exc.msg} "
+                f"(line {exc.lineno}, column {exc.colno})"
             )
-        blocks.append(f"```tool\n{payload}\n```")
-    return "\n".join(blocks)
+        else:
+            if isinstance(decoded, dict):
+                arguments = decoded
+            else:
+                parse_error = (
+                    "arguments must decode to a JSON object, got "
+                    f"{type(decoded).__name__}"
+                )
+        raw_id = call.get("id", "")
+        call_id = raw_id if isinstance(raw_id, str) else str(raw_id)
+        parsed_calls.append(
+            NativeToolCall(
+                id=call_id,
+                name=name,
+                raw_arguments=raw_arguments,
+                arguments=arguments,
+                parse_error=parse_error,
+            )
+        )
+    return tuple(parsed_calls)
 
 
 def _extract_delta(payload: dict[str, object]) -> str:
@@ -662,20 +891,40 @@ def _merge_stream_tool_calls(
         index = raw_index if isinstance(raw_index, int) else position
         entry = accumulated.setdefault(
             index,
-            {"type": "function", "function": {"name": "", "arguments": ""}},
+            {
+                "id": "",
+                "type": "function",
+                "function": {"name": "", "arguments": ""},
+            },
         )
+        call_id = call.get("id")
+        if isinstance(call_id, str):
+            entry["id"] = _merge_stream_fragment(str(entry.get("id", "")), call_id)
+        call_type = call.get("type")
+        if isinstance(call_type, str):
+            entry["type"] = call_type
         function = call.get("function")
         if not isinstance(function, dict):
             continue
         target = entry["function"]
         name = function.get("name")
         if isinstance(name, str):
-            target["name"] += name
+            target["name"] = _merge_stream_fragment(target["name"], name)
         arguments = function.get("arguments")
         if isinstance(arguments, str):
             target["arguments"] += arguments
         elif arguments is not None:
             target["arguments"] += json.dumps(arguments, ensure_ascii=False)
+
+
+def _merge_stream_fragment(current: str, fragment: str) -> str:
+    if not current:
+        return fragment
+    if fragment == current or current.endswith(fragment):
+        return current
+    if fragment.startswith(current):
+        return fragment
+    return current + fragment
 
 
 def _free_port() -> int:

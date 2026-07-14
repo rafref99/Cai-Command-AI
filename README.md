@@ -1,37 +1,40 @@
 # Cai
 
-**A lightweight terminal coding agent for hosted APIs and local models.**
+Cai 1.1.2 is a lightweight terminal coding agent for hosted APIs and local
+models. It can inspect, edit, and validate a project while keeping file and
+shell access inside a controlled workspace.
 
-Cai can inspect, edit, and validate projects from the command line. It supports
-OpenAI-compatible APIs, local model servers, command-backed model adapters, and
-local model files launched through runners such as `llama-server`.
+> Cai is alpha software. Review requested actions and keep important work under
+> version control.
 
-![Cai terminal interface](preview.png)
+## Features
 
-> Cai is currently alpha software. Review proposed actions and keep important
-> work under version control.
-
-## Highlights
-
-- Work interactively with `cai chat` or run one prompt with `cai once`.
-- Connect to hosted or local OpenAI-compatible `/chat/completions` endpoints.
-- Use native function calling when supported, with resilient text-based tool
-  parsing for local models.
-- Read, search, create, edit, move, and validate files inside a controlled
-  workspace.
-- Preview changes, require approvals, create snapshots, and export transcripts.
-- Run without third-party runtime dependencies on Python 3.10 or newer.
+- Interactive sessions with `cai chat` and scriptable one-shot tasks with
+  `cai once`.
+- Hosted and local OpenAI-compatible APIs, local model files, and command-based
+  provider adapters.
+- Native function calling when supported, plus resilient textual tool-call
+  parsing for local models such as Gemma.
+- File inspection, search, precise editing, workspace review, Python checks,
+  and shell commands.
+- Per-action or session approvals, dry-run previews, optional snapshots, and
+  workspace boundaries.
+- Compact `Thinking`, `Working`, tool activity, and `Done` output with
+  elapsed time and provider token usage when available.
+- Configuration profiles, transcript export, shell completion, themes, and
+  accessible plain-terminal output.
+- No third-party runtime dependencies; Python 3.10 or newer is required.
 
 ## Installation
 
-From the project directory, install Cai in editable mode:
+From the project directory:
 
 ```bash
 python3 -m pip install -e .
-cai --help
+cai --version
 ```
 
-You can also run Cai without installing the console script:
+You can also run the package without installing the `cai` command:
 
 ```bash
 python3 -m cai --help
@@ -39,7 +42,7 @@ python3 -m cai --help
 
 ## Quick Start
 
-Create a configuration, verify it, and start an interactive session:
+Create a configuration, check it, and start chatting:
 
 ```bash
 cai setup
@@ -47,21 +50,33 @@ cai doctor
 cai chat
 ```
 
-Cai stores its user configuration in `~/.cai/config.json`. The current
-directory is used as the workspace unless `--workspace PATH` or
-`CAI_WORKSPACE` is set.
+For a shorter setup flow, select a hosted or common local provider:
+
+```bash
+cai setup --quick lm-studio --model "<model-name>"
+cai setup --quick ollama --model "<model-name>"
+cai setup --quick hosted --model "<model-name>"
+cai setup --quick auto --model "<model-name>"
+```
+
+`--quick auto` selects the first reachable built-in localhost endpoint. The
+full `cai setup` wizard supports custom URLs, command adapters, local model
+files, and advanced safety settings.
 
 Run a single task and exit:
 
 ```bash
-cai once "Inspect this project and recommend the next test to add."
+cai once "Inspect this project and run the most relevant tests."
+cai once --prompt-file task.md --output answer.md
+cai once --output-format json "Summarize the workspace."
 ```
 
-## Provider Setup
+Chat and one-shot commands use the launch directory as the workspace unless
+`--workspace PATH` or `CAI_WORKSPACE` is set.
 
-### Hosted API
+## Providers
 
-Use any provider that exposes an OpenAI-compatible chat-completions endpoint:
+### Hosted OpenAI-Compatible API
 
 ```bash
 export OPENAI_API_KEY="..."
@@ -75,93 +90,118 @@ cai chat \
 
 ### Local API Server
 
-Cai includes presets for Ollama, LM Studio, vLLM, llama.cpp, and
+Cai includes presets for LM Studio, Ollama, llama.cpp, vLLM, and
 text-generation-webui:
 
 ```bash
 cai presets
-cai chat --preset lm-studio --model "<local-model-name>"
+cai chat --preset lm-studio --model "<model-name>"
 ```
 
-You can also provide an endpoint directly:
+For a custom endpoint:
 
 ```bash
 cai chat \
   --base-url http://127.0.0.1:1234/v1 \
-  --model "<local-model-name>"
+  --model "<model-name>"
 ```
 
-### Local Model File
+Use `--native-tools` only when the endpoint and model support structured
+function calling. Cai otherwise uses its text-tool compatibility layer.
 
-Cai can start a local model file through an installed runner:
+Local model files and command adapters are documented in the
+[Operating Guide](OPERATING.md#choose-a-provider).
+
+## Configuration Profiles
+
+The default configuration is stored in `~/.cai/config.json`; named profiles
+are stored in `~/.cai/profiles/`.
 
 ```bash
-cai chat \
-  --local-model "/path/to/model.gguf" \
-  --runner-command "llama-server --model {model_path} --port {port}" \
-  --model local-model
+cai setup --profile local
+cai setup --profile hosted
+cai profiles list
+cai profiles use local
+cai chat --profile hosted
 ```
 
-If `--runner-command` is omitted, Cai looks for `llama-server` or
-`llama-cpp-server` on `PATH`.
+Use environment variables for API keys. Profile selection priority is:
+`--profile`, `CAI_PROFILE`, the profile selected by `cai profiles use`,
+then `default`.
 
-### Command Adapter
+## Interactive Commands
 
-A custom command can act as the model provider. It receives conversation JSON
-on standard input and prints assistant text on standard output:
-
-```bash
-cai once \
-  --provider command \
-  --command-provider-argv "python3 ./my-provider-wrapper.py" \
-  "Summarize this workspace."
-```
-
-## Safety Model
-
-Cai uses conservative defaults for operations that affect the system:
-
-- File tools are restricted to the active workspace.
-- Writes, deletions, moves, and shell commands require approval.
-- `--dry-run` previews file changes without applying them.
-- `--snapshot-dir PATH` saves existing files before modification.
-- File-size, shell-timeout, and command-output limits are configurable.
-- `Ctrl-C` interrupts model generation without ending an interactive session.
-
-Use `-y` or `--yes` only in trusted workspaces; it auto-approves write and shell
-actions.
-
-## Main Commands
+Enter `/help` during `cai chat` to see all session commands.
 
 | Command | Purpose |
 | --- | --- |
-| `cai setup` | Create or update the saved configuration. |
-| `cai doctor` | Validate provider, model, workspace, and runner settings. |
-| `cai presets` | List built-in local-server presets. |
-| `cai chat` | Start an interactive coding session. |
-| `cai once "..."` | Run one task and exit. |
+| `/status`, `/context`, `/permissions` | Inspect session state, context usage, and safety policy. |
+| `/model [NAME]`, `/provider`, `/config` | Inspect or change model and provider settings. |
+| `/pwd`, `/cd PATH` | Inspect or change the active workspace. |
+| `/diff` | Review tracked and untracked workspace changes. |
+| `/activity [N\|all]`, `/tools` | Inspect recent tool calls and available tools. |
+| `/compact`, `/clear` | Reduce model context or clear conversation history. |
+| `/thinking` | Toggle raw visible model output while it is generated. |
+| `/export [PATH]` | Export the current conversation to Markdown. |
+| `/help`, `/exit` | Show help or end the session. |
+
+Raw output shown by `/thinking` may include textual tool syntax from local
+models. Leave it off for the cleanest interface.
+
+## Safety and Approvals
+
+By default:
+
+- File tools stay inside the active workspace.
+- Writes, moves, deletions, and shell commands require approval.
+- `--dry-run` previews mutations without applying them.
+- `--snapshot-dir PATH` preserves existing files before modification.
+- `Ctrl-C` interrupts model work without closing an interactive session.
+
+Approval choices are:
+
+- `y`: approve this action once.
+- `a`: approve similar actions for the current session.
+- `d`: inspect the full command or diff.
+- `n` or Enter: reject the action.
+
+Use `--yes` only in a trusted workspace.
+
+## Main CLI Commands
+
+| Command | Purpose |
+| --- | --- |
+| `cai setup` | Create or update a configuration profile. |
 | `cai config` | Inspect or change saved configuration values. |
+| `cai profiles` | Create, list, select, or delete profiles. |
+| `cai doctor` | Check provider, model, workspace, and runner settings. |
+| `cai presets` | List built-in local-provider presets. |
+| `cai chat` | Start an interactive session. |
+| `cai once` | Run one task and exit. |
+| `cai completion SHELL` | Print Bash, Zsh, or Fish completion. |
+| `cai demo` | Render a deterministic terminal-interface demo. |
 
-Run `cai <command> --help` for all available options.
+Run `cai <command> --help` for every option.
 
-## Development
-
-Install the development tools and run the same checks used by CI:
+## Terminal Controls
 
 ```bash
-python3 -m pip install -e '.[dev]'
-python3 -m ruff check cai tests
-python3 -m mypy cai tests
-python3 -m unittest
+cai --theme high-contrast chat
+cai --theme monochrome chat
+cai --ascii chat
+cai --key-bindings vi chat
+eval "$(cai completion zsh)"
 ```
 
-The test suite covers the agent loop, model-response parsing, workspace tools,
-configuration, provider adapters, transcript export, and local integration
-paths.
+Related environment variables include `CAI_THEME`, `CAI_KEY_BINDINGS`,
+`CAI_REDUCED_MOTION`, `CAI_PLAIN`, and `NO_COLOR`. Use
+`--no-hyperlinks` when terminal file links are not wanted.
 
 ## Documentation
 
-- [Operating Guide](OPERATING.md): provider configuration and runtime details.
-- [Feature Reference](FEATURES.md): supported tools, controls, and behavior.
-- [Contributing Guide](CONTRIBUTING.md): development setup and change checks.
-- [Project Backlog](todo.md): planned improvements and open work.
+- [Operating Guide](OPERATING.md) — setup, providers, configuration, scripting,
+  and troubleshooting.
+- [Feature Reference](FEATURES.md) — tools, safety behavior, and model
+  compatibility.
+- [Contributing Guide](CONTRIBUTING.md) — development setup and validation.
+- [License](LICENSE).

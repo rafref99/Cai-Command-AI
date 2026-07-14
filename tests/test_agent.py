@@ -4,8 +4,10 @@ import shlex
 import stat
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from cai.agent import (
     CodingAgent,
@@ -14,7 +16,7 @@ from cai.agent import (
     parse_tool_response,
     strip_tool_blocks,
 )
-from cai.providers import Message
+from cai.providers import Message, ModelResponse, TokenUsage
 from cai.tools import ToolContext, ToolError
 from cai.tui import TerminalUI
 
@@ -23,7 +25,28 @@ class NoopUI(TerminalUI):
     def status(self, text: str) -> None:
         return None
 
+    def activity(
+        self,
+        label: str,
+        detail: str = "",
+        *,
+        state: str = "active",
+        elapsed: float | None = None,
+    ) -> None:
+        return None
+
     def panel(self, title: str, body: str, color: str = "cyan") -> None:
+        return None
+
+    def tool_activity(
+        self,
+        name: str,
+        arguments: dict[str, object],
+        result: str,
+        *,
+        ok: bool,
+        elapsed: float,
+    ) -> None:
         return None
 
     def approve(self, question: str) -> bool:
@@ -47,9 +70,21 @@ class CaptureStatusUI(NoopUI):
     def __init__(self, *, no_color: bool = True) -> None:
         super().__init__(no_color=no_color)
         self.statuses: list[str] = []
+        self.tool_activities: list[tuple[str, bool]] = []
 
     def status(self, text: str) -> None:
         self.statuses.append(text)
+
+    def tool_activity(
+        self,
+        name: str,
+        arguments: dict[str, object],
+        result: str,
+        *,
+        ok: bool,
+        elapsed: float,
+    ) -> None:
+        self.tool_activities.append((name, ok))
 
 
 class FakeClient:
@@ -82,6 +117,14 @@ class StreamingClient:
         return "visible output"
 
 
+class UsageClient:
+    model = "fake"
+    native_tools = False
+
+    def complete(self, messages: list[Message], on_delta=None) -> ModelResponse:  # type: ignore[no-untyped-def]
+        return ModelResponse("done", usage=TokenUsage(80, 20, 100))
+
+
 class MalformedToolClient:
     model = "fake"
 
@@ -108,6 +151,87 @@ class GemmaToolClient:
             return '<|tool_call>call:run_shell{command:<|"|>mkdir tic<|"|>}<tool_call|>'
         self.last_messages = [message.copy() for message in messages]
         return "Created tic."
+
+
+class LabeledJsonDeleteClient:
+    model = "gemma"
+    native_tools = False
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, messages: list[Message], on_delta=None) -> str:  # type: ignore[no-untyped-def]
+        self.calls += 1
+        self.last_messages = [message.copy() for message in messages]
+        if self.calls == 1:
+            return (
+                "Tool call:\n"
+                "```json\n"
+                '{"name":"delete_path","arguments":{"path":"script.py"}}\n'
+                "```"
+            )
+        if self.calls == 2:
+            return (
+                "Tool call:\n"
+                "```json\n"
+                '{"name":"delete_path","arguments":{"path":"wiki_entry.txt"}}\n'
+                "```"
+            )
+        return "Done."
+
+
+class LabeledInlineDeleteClient:
+    model = "gemma"
+    native_tools = False
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, messages: list[Message], on_delta=None) -> str:  # type: ignore[no-untyped-def]
+        self.calls += 1
+        self.last_messages = [message.copy() for message in messages]
+        if self.calls == 1:
+            return 'Tool call: delete_path(path="script.py")'
+        if self.calls == 2:
+            return 'Earlier tool calls: delete_path({"path": "wiki_entry.txt"})'
+        return "Done."
+
+
+class MultipleRawToolsClient:
+    model = "gemma"
+    native_tools = False
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, messages: list[Message], on_delta=None) -> str:  # type: ignore[no-untyped-def]
+        self.calls += 1
+        self.last_messages = [message.copy() for message in messages]
+        if self.calls == 1:
+            return '''I will create both files.
+
+```tool
+write_file path="hello_random.py"
+```
+```python
+print("hello")
+```
+
+Next I will create the story.
+
+```tool
+write_file path="story_random.txt"
+```
+```text
+Random numbers tell a deterministic story.
+```
+
+I will verify both files.
+
+```tool
+{"name":"list_files","arguments":{"path":"."}}
+```'''
+        return "Created `hello_random.py` and `story_random.txt`."
 
 
 class MixedValidAndMalformedToolClient:
@@ -177,6 +301,25 @@ class HallucinatedFileClaimClient:
         return "I have created `tic/main.py`."
 
 
+class NestedDirectoryListingClient:
+    model = "fake"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def complete(self, messages: list[Message], on_delta=None) -> str:  # type: ignore[no-untyped-def]
+        self.calls += 1
+        self.last_messages = [message.copy() for message in messages]
+        if self.calls == 1:
+            return (
+                "I will list the contents of the `folder` directory.\n"
+                "```tool\n"
+                '{"name": "run_shell", "arguments": {"command": "ls -l folder"}}\n'
+                "```"
+            )
+        return "I created `script.py` and `wiki_entry.txt` in the directory."
+
+
 class ToolParsingTests(unittest.TestCase):
     def test_parse_fenced_tool_call(self) -> None:
         text = """Need to inspect.
@@ -189,6 +332,59 @@ class ToolParsingTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0].name, "read_file")
         self.assertEqual(calls[0].arguments["path"], "a.py")
+
+    def test_parse_labeled_json_tool_call_from_gemma(self) -> None:
+        text = '''Tool call:
+```json
+{"name":"delete_path","arguments":{"path":"script.py"}}
+```'''
+
+        parsed = parse_tool_response(text)
+
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(len(parsed.calls), 1)
+        self.assertEqual(parsed.calls[0].name, "delete_path")
+        self.assertEqual(parsed.calls[0].arguments, {"path": "script.py"})
+        self.assertEqual(strip_tool_blocks(text), "")
+
+    def test_plain_json_example_is_not_executed_as_tool_call(self) -> None:
+        text = '''Example configuration:
+```json
+{"name":"delete_path","arguments":{"path":"script.py"}}
+```'''
+
+        parsed = parse_tool_response(text)
+
+        self.assertEqual(parsed.calls, [])
+        self.assertEqual(parsed.errors, [])
+
+    def test_parse_labeled_inline_tool_call_from_gemma(self) -> None:
+        text = 'Tool call: delete_path(path="script.py")'
+
+        parsed = parse_tool_response(text)
+
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(len(parsed.calls), 1)
+        self.assertEqual(parsed.calls[0].name, "delete_path")
+        self.assertEqual(parsed.calls[0].arguments, {"path": "script.py"})
+        self.assertEqual(strip_tool_blocks(text), "")
+
+    def test_unlabeled_inline_example_is_not_executed_as_tool_call(self) -> None:
+        parsed = parse_tool_response('Example: delete_path(path="script.py")')
+
+        self.assertEqual(parsed.calls, [])
+        self.assertEqual(parsed.errors, [])
+
+    def test_parse_earlier_tool_calls_with_positional_arguments_from_gemma(self) -> None:
+        text = 'Earlier tool calls: delete_path({"path": "wiki_entry.txt"})'
+
+        parsed = parse_tool_response(text)
+
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(len(parsed.calls), 1)
+        self.assertEqual(parsed.calls[0].name, "delete_path")
+        self.assertEqual(parsed.calls[0].arguments, {"path": "wiki_entry.txt"})
+        self.assertEqual(strip_tool_blocks(text), "")
 
     def test_strip_tool_block(self) -> None:
         text = 'hello\n```tool\n{"name": "x", "arguments": {}}\n```\nbye'
@@ -269,6 +465,47 @@ def main():
         self.assertEqual(parsed.calls[0].arguments["start_line"], 129)
         self.assertEqual(parsed.calls[0].arguments["end_line"], 135)
         self.assertIn("def main", parsed.calls[0].arguments["content"])
+
+    def test_parse_multiple_raw_writes_without_crossing_fence_boundaries(self) -> None:
+        text = '''I will create both files.
+
+```tool
+write_file path="hello_random.py"
+```
+```python
+print("hello")
+```
+
+Next I will create the story.
+
+```tool
+write_file path="story_random.txt"
+```
+```text
+Random numbers tell a deterministic story.
+```
+
+```tool
+{"name":"list_files","arguments":{"path":"."}}
+```'''
+
+        parsed = parse_tool_response(text)
+
+        self.assertEqual(parsed.errors, [])
+        self.assertEqual(
+            [call.name for call in parsed.calls],
+            ["write_file", "write_file", "list_files"],
+        )
+        self.assertEqual(parsed.calls[0].arguments["path"], "hello_random.py")
+        self.assertEqual(parsed.calls[0].arguments["content"], 'print("hello")\n')
+        self.assertEqual(parsed.calls[1].arguments["path"], "story_random.txt")
+        self.assertEqual(
+            parsed.calls[1].arguments["content"],
+            "Random numbers tell a deterministic story.\n",
+        )
+        visible = strip_tool_blocks(text)
+        self.assertNotIn("write_file path", visible)
+        self.assertNotIn("```text", visible)
 
     def test_header_only_content_tool_is_not_executed_without_content(self) -> None:
         text = '''```tool
@@ -642,6 +879,39 @@ after'''
             self.assertEqual(len(claims), 1)
             self.assertEqual(claims[0].path, "tic/main_game.py")
 
+    def test_nested_basenames_use_verified_directory_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "folder"
+            folder.mkdir()
+            (folder / "script.py").write_text("print('ok')\n", encoding="utf-8")
+            (folder / "wiki_entry.txt").write_text("entry\n", encoding="utf-8")
+            text = "I created `script.py` and `wiki_entry.txt` in the directory."
+
+            claims = find_unverified_file_claims(
+                text,
+                root,
+                known_directories=[folder],
+            )
+
+            self.assertEqual(claims, [])
+
+    def test_explicit_root_claim_does_not_use_nested_directory_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "folder"
+            folder.mkdir()
+            (folder / "script.py").write_text("print('ok')\n", encoding="utf-8")
+
+            claims = find_unverified_file_claims(
+                "I created `./script.py`.",
+                root,
+                known_directories=[folder],
+            )
+
+            self.assertEqual(len(claims), 1)
+            self.assertEqual(claims[0].path, "script.py")
+
 
 class ToolContextTests(unittest.TestCase):
     def test_workspace_restriction(self) -> None:
@@ -659,6 +929,62 @@ class ToolContextTests(unittest.TestCase):
 
             self.assertIn("model protocol marker", str(captured.exception))
 
+    def test_required_path_arguments_reject_missing_none_and_empty_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "source.txt").write_text("source\n", encoding="utf-8")
+            context = ToolContext(workspace=root, ui=NoopUI(no_color=True))
+            cases: list[tuple[str, str, dict[str, object]]] = [
+                ("file_info", "path", {}),
+                ("read_file", "path", {}),
+                ("create_dir", "path", {}),
+                ("write_file", "path", {"content": "new"}),
+                ("replace_text", "path", {"old": "old", "new": "new"}),
+                ("append_file", "path", {"content": "new"}),
+                ("insert_lines", "path", {"after_line": 0, "content": "new"}),
+                (
+                    "replace_lines",
+                    "path",
+                    {"start_line": 1, "end_line": 1, "content": "new"},
+                ),
+                ("copy_file", "source", {"destination": "copy.txt"}),
+                ("copy_file", "destination", {"source": "source.txt"}),
+                ("move_path", "source", {"destination": "moved.txt"}),
+                ("move_path", "destination", {"source": "source.txt"}),
+                ("delete_path", "path", {}),
+                ("python_symbols", "path", {}),
+                ("replace_symbol", "path", {"name": "example", "content": ""}),
+                ("python_syntax_check", "path", {}),
+            ]
+
+            for tool_name, key, base_arguments in cases:
+                for label, value in (("missing", None), ("none", None), ("empty", "")):
+                    arguments = dict(base_arguments)
+                    if label != "missing":
+                        arguments[key] = value
+                    with self.subTest(tool=tool_name, key=key, value=label):
+                        with self.assertRaises(ToolError) as captured:
+                            getattr(context, tool_name)(arguments)
+                        self.assertIn(f"`{key}`", str(captured.exception))
+
+    def test_optional_root_paths_default_but_reject_explicit_empty_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sample.txt").write_text("needle\n", encoding="utf-8")
+            context = ToolContext(workspace=root, ui=NoopUI(no_color=True))
+
+            self.assertIn("sample.txt", context.list_files({}))
+            self.assertIn("sample.txt:1", context.search({"pattern": "needle"}))
+            for tool_name, arguments in (
+                ("list_files", {"path": None}),
+                ("list_files", {"path": ""}),
+                ("search", {"pattern": "needle", "path": None}),
+                ("search", {"pattern": "needle", "path": ""}),
+            ):
+                with self.subTest(tool=tool_name, arguments=arguments):
+                    with self.assertRaises(ToolError):
+                        getattr(context, tool_name)(arguments)
+
     def test_read_file_with_line_numbers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -667,6 +993,56 @@ class ToolContextTests(unittest.TestCase):
             result = context.read_file({"path": "sample.txt", "start_line": 2, "max_lines": 1})
             self.assertIn("2 | two", result)
             self.assertNotIn("one", result)
+
+    def test_read_file_output_is_capped_with_actionable_pagination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "sample.txt"
+            path.write_text(
+                "".join(f"line {number} {'x' * 35}\n" for number in range(1, 6)),
+                encoding="utf-8",
+            )
+            context = ToolContext(
+                workspace=root,
+                ui=NoopUI(no_color=True),
+                max_output_chars=100,
+            )
+
+            first = context.read_file({"path": "sample.txt"})
+
+            self.assertLessEqual(len(first), 100)
+            self.assertIn("1 | line 1", first)
+            self.assertIn("next_start_line: 2", first)
+            second = context.read_file({"path": "sample.txt", "start_line": 2})
+            self.assertIn("2 | line 2", second)
+
+            (root / "long.txt").write_text(f"{'x' * 500}\nnext\n", encoding="utf-8")
+            narrow_context = ToolContext(
+                workspace=root,
+                ui=NoopUI(no_color=True),
+                max_output_chars=40,
+            )
+            long_line = narrow_context.read_file({"path": "long.txt"})
+            self.assertLessEqual(len(long_line), 40)
+            self.assertIn("next_start_line: 2", long_line)
+
+    def test_result_count_and_read_line_limits_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "sample.txt").write_text("needle\n", encoding="utf-8")
+            context = ToolContext(workspace=root, ui=NoopUI(no_color=True))
+            cases = [
+                ("list_files", {"path": "."}, "max_results", 201),
+                ("search", {"pattern": "needle"}, "max_results", 121),
+                ("read_file", {"path": "sample.txt"}, "max_lines", 241),
+            ]
+
+            for tool_name, base_arguments, key, upper_value in cases:
+                for value in (0, upper_value):
+                    arguments = {**base_arguments, key: value}
+                    with self.subTest(tool=tool_name, value=value):
+                        with self.assertRaises(ToolError):
+                            getattr(context, tool_name)(arguments)
 
     def test_read_file_refuses_files_over_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -767,6 +1143,49 @@ class ToolContextTests(unittest.TestCase):
             self.assertIn("(no matches)", result)
             self.assertIn("Skipped 1 file(s)", result)
 
+    def test_listing_and_search_outputs_are_capped_and_deterministic(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for directory in ("zeta", "alpha"):
+                nested = root / directory
+                nested.mkdir()
+                (nested / f"{'x' * 30}.txt").write_text("needle\n", encoding="utf-8")
+            (root / "root.txt").write_text("needle\n", encoding="utf-8")
+            context = ToolContext(
+                workspace=root,
+                ui=NoopUI(no_color=True),
+                max_output_chars=100,
+            )
+
+            listing = context.list_files({})
+            search = context.search({"pattern": "needle"})
+
+            self.assertLessEqual(len(listing), 100)
+            self.assertLessEqual(len(search), 100)
+            self.assertIn("...truncated...", listing)
+            self.assertIn("...truncated...", search)
+            self.assertLess(listing.index("alpha/"), listing.index("zeta/"))
+            self.assertLess(search.index("root.txt"), search.index("alpha/"))
+
+    def test_execute_applies_shared_model_output_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            context = ToolContext(
+                workspace=root,
+                ui=NoopUI(no_color=True),
+                max_output_chars=80,
+                dry_run=True,
+            )
+
+            result = context.execute(
+                "write_file",
+                {"path": "sample.txt", "content": "content\n" * 100},
+            )
+
+            self.assertLessEqual(len(result), 80)
+            self.assertIn("...truncated...", result)
+            self.assertFalse((root / "sample.txt").exists())
+
     def test_dry_run_replace_does_not_modify_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -777,6 +1196,7 @@ class ToolContextTests(unittest.TestCase):
             result = context.replace_text({"path": "sample.txt", "old": "old", "new": "new"})
 
             self.assertIn("DRY RUN", result)
+            self.assertIn("changes: +1 -1", result)
             self.assertIn("+new", result)
             self.assertEqual(path.read_text(encoding="utf-8"), "old\n")
 
@@ -903,24 +1323,27 @@ class ToolContextTests(unittest.TestCase):
 
             self.assertIn("past end of file", str(captured.exception))
 
-    def test_replace_lines_clamps_end_line_past_eof(self) -> None:
+    def test_replace_lines_requires_explicit_to_eof_for_stale_end_line(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path = root / "sample.py"
             path.write_text("one\ntwo\nthree\n", encoding="utf-8")
             context = ToolContext(workspace=root, ui=NoopUI(no_color=True))
 
-            result = context.replace_lines(
-                {
-                    "path": "sample.py",
-                    "start_line": 2,
-                    "end_line": 142,
-                    "content": "TWO\n",
-                }
-            )
+            arguments = {
+                "path": "sample.py",
+                "start_line": 2,
+                "end_line": 142,
+                "content": "TWO\n",
+            }
+
+            with self.assertRaisesRegex(ToolError, "set to_eof=true"):
+                context.replace_lines(arguments)
+            self.assertEqual(path.read_text(encoding="utf-8"), "one\ntwo\nthree\n")
+
+            result = context.replace_lines({**arguments, "to_eof": True})
 
             self.assertIn("Replaced lines 2-3 in sample.py.", result)
-            self.assertIn("clamped to EOF line 3", result)
             self.assertEqual(path.read_text(encoding="utf-8"), "one\nTWO\n")
 
     def test_python_symbols_fallback_handles_syntax_broken_file(self) -> None:
@@ -941,6 +1364,57 @@ class ToolContextTests(unittest.TestCase):
             self.assertIn("parser: fallback indentation scan", result)
             self.assertIn("function handle_click: lines 1-2", result)
             self.assertIn("function after: lines 4-5", result)
+
+    def test_python_symbols_output_is_capped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "many.py").write_text(
+                "\n".join(
+                    f"def function_{number}():\n    return {number}\n"
+                    for number in range(20)
+                ),
+                encoding="utf-8",
+            )
+            context = ToolContext(
+                workspace=root,
+                ui=NoopUI(no_color=True),
+                max_output_chars=100,
+            )
+
+            result = context.python_symbols({"path": "many.py"})
+
+            self.assertLessEqual(len(result), 100)
+            self.assertIn("parser: ast", result)
+            self.assertIn("...truncated...", result)
+
+    def test_replace_symbol_fallback_preserves_following_top_level_statement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "broken.py"
+            path.write_text(
+                "def broken():\n"
+                "    return (\n"
+                "\n"
+                "IMPORTANT = 1\n",
+                encoding="utf-8",
+            )
+            context = ToolContext(workspace=root, ui=NoopUI(no_color=True))
+
+            symbols = context.python_symbols({"path": "broken.py"})
+            result = context.replace_symbol(
+                {
+                    "path": "broken.py",
+                    "name": "broken",
+                    "content": "def broken():\n    return 0\n",
+                }
+            )
+
+            self.assertIn("function broken: lines 1-2", symbols)
+            self.assertIn("Replaced function broken at lines 1-2", result)
+            self.assertEqual(
+                path.read_text(encoding="utf-8"),
+                "def broken():\n    return 0\n\nIMPORTANT = 1\n",
+            )
 
     def test_replace_symbol_replaces_function_in_syntax_broken_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1074,6 +1548,76 @@ class ToolContextTests(unittest.TestCase):
                 context.run_shell({"command": command, "timeout_seconds": 1})
             self.assertIn("timed out", str(captured.exception))
 
+    @unittest.skipUnless(sys.platform != "win32", "POSIX process-group behavior")
+    def test_run_shell_timeout_terminates_descendant_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "child-terminated"
+            child_code = (
+                "import signal,sys,time; from pathlib import Path; "
+                "signal.signal(signal.SIGTERM, lambda *_: "
+                "(Path(sys.argv[1]).write_text('stopped'), sys.exit(0))); "
+                "time.sleep(30)"
+            )
+            parent_code = (
+                "import subprocess,sys,time; "
+                f"subprocess.Popen([sys.executable, '-c', {child_code!r}, sys.argv[1]]); "
+                "time.sleep(30)"
+            )
+            command = " ".join(
+                shlex.quote(part)
+                for part in (sys.executable, "-c", parent_code, str(marker))
+            )
+            context = ToolContext(
+                workspace=root,
+                ui=NoopUI(no_color=True),
+                auto_approve=True,
+                max_shell_timeout=1,
+            )
+
+            with self.assertRaisesRegex(ToolError, "timed out"):
+                context.run_shell({"command": command, "timeout_seconds": 1})
+
+            deadline = time.monotonic() + 2
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(marker.exists(), "descendant did not receive process-group SIGTERM")
+
+    def test_run_shell_dry_run_never_executes_or_requests_approval(self) -> None:
+        class RejectApprovalUI(NoopUI):
+            def approve(self, question: str) -> bool:
+                raise AssertionError("dry-run shell command requested approval")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            context = ToolContext(
+                workspace=root,
+                ui=RejectApprovalUI(no_color=True),
+                dry_run=True,
+            )
+
+            result = context.run_shell({"command": "touch should-not-exist.txt"})
+
+            self.assertIn("DRY RUN", result)
+            self.assertIn("touch should-not-exist.txt", result)
+            self.assertFalse((root / "should-not-exist.txt").exists())
+
+    def test_run_shell_output_uses_shared_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            context = ToolContext(
+                workspace=root,
+                ui=NoopUI(no_color=True),
+                max_output_chars=80,
+            )
+            script = "print('x' * 500)"
+            command = f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}"
+
+            result = context.run_shell({"command": command})
+
+            self.assertLessEqual(len(result), 80)
+            self.assertIn("...truncated...", result)
+
     def test_write_file_honors_approval_denial(self) -> None:
         class DenyUI(NoopUI):
             def approve(self, question: str) -> bool:
@@ -1085,8 +1629,21 @@ class ToolContextTests(unittest.TestCase):
 
             with self.assertRaises(ToolError):
                 context.write_file({"path": "sample.txt", "content": "new"})
-
             self.assertFalse((root / "sample.txt").exists())
+
+    def test_tool_context_tracks_approval_wait_separately_from_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            context = ToolContext(workspace=root, ui=NoopUI(no_color=True))
+
+            with patch("cai.tools.time.perf_counter", side_effect=[10.0, 15.5]):
+                context.execute(
+                    "write_file",
+                    {"path": "sample.txt", "content": "new\n"},
+                )
+
+            self.assertEqual(context.last_approval_wait_seconds, 5.5)
+            self.assertTrue((root / "sample.txt").exists())
 
     def test_write_file_requires_explicit_content_without_truncating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1128,7 +1685,7 @@ class ToolContextTests(unittest.TestCase):
 
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
 
-    def test_execute_wraps_bad_model_arguments_as_tool_error(self) -> None:
+    def test_execute_reports_precise_bad_model_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "sample.txt").write_text("hello\n", encoding="utf-8")
@@ -1140,7 +1697,7 @@ class ToolContextTests(unittest.TestCase):
                     {"path": "sample.txt", "start_line": "not a number"},
                 )
 
-            self.assertIn("Invalid arguments for read_file", str(captured.exception))
+            self.assertIn("start_line must be an integer", str(captured.exception))
 
     def test_list_files_uses_configured_ignores(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1188,7 +1745,7 @@ class AgentLoopTests(unittest.TestCase):
 
             self.assertIn("Thinking: waiting for model response", ui.statuses)
             self.assertIn("Working: parsing assistant response", ui.statuses)
-            self.assertIn("Working: read_file", ui.statuses)
+            self.assertIn(("read_file", True), ui.tool_activities)
             self.assertIn("Reasoning: waiting for model follow-up (2/12)", ui.statuses)
 
     def test_agent_set_workspace_updates_tools_and_prompt(self) -> None:
@@ -1204,6 +1761,22 @@ class AgentLoopTests(unittest.TestCase):
 
             self.assertEqual(agent.tools.workspace, other.resolve())
             self.assertIn(str(other.resolve()), agent.messages[0]["content"])
+
+    def test_agent_can_switch_model_without_discarding_conversation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = NoopUI(no_color=True)
+            client = StreamingClient()
+            agent = CodingAgent(
+                client=client,
+                tools=ToolContext(workspace=Path(tmp), ui=ui),
+                ui=ui,
+            )
+            agent.messages.append({"role": "user", "content": "keep this"})
+
+            agent.set_model("replacement-model")
+
+            self.assertEqual(client.model, "replacement-model")
+            self.assertEqual(agent.messages[-1]["content"], "keep this")
 
     def test_agent_prefers_provider_native_tools_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1237,6 +1810,21 @@ class AgentLoopTests(unittest.TestCase):
             self.assertEqual(ui.streamed, "visible output")
             self.assertTrue(ui.stream_ended)
 
+    def test_agent_accumulates_provider_usage_per_task_and_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ui = NoopUI(no_color=True)
+            agent = CodingAgent(
+                client=UsageClient(),
+                tools=ToolContext(workspace=Path(tmp), ui=ui),
+                ui=ui,
+            )
+
+            agent.run("First question")
+            agent.run("Second question")
+
+            self.assertEqual(agent.last_usage, TokenUsage(80, 20, 100))
+            self.assertEqual(agent.total_usage, TokenUsage(160, 40, 200))
+
     def test_agent_returns_malformed_tool_feedback_to_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1264,6 +1852,63 @@ class AgentLoopTests(unittest.TestCase):
             self.assertEqual(answer, "Created tic.")
             self.assertTrue((root / "tic").is_dir())
             self.assertIn("Tool results", client.last_messages[-1]["content"])
+
+    def test_agent_executes_gemma_labeled_json_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "script.py").write_text("pass\n", encoding="utf-8")
+            (root / "wiki_entry.txt").write_text("entry\n", encoding="utf-8")
+            ui = NoopUI(no_color=True)
+            tools = ToolContext(workspace=root, ui=ui, auto_approve=True)
+            client = LabeledJsonDeleteClient()
+            agent = CodingAgent(client=client, tools=tools, ui=ui)
+
+            answer = agent.run("Delete both files.")
+
+            self.assertEqual(answer, "Done.")
+            self.assertEqual(client.calls, 3)
+            self.assertFalse((root / "script.py").exists())
+            self.assertFalse((root / "wiki_entry.txt").exists())
+            self.assertIn("Tool results", client.last_messages[-1]["content"])
+
+    def test_agent_executes_gemma_labeled_inline_tool_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "script.py").write_text("pass\n", encoding="utf-8")
+            (root / "wiki_entry.txt").write_text("entry\n", encoding="utf-8")
+            ui = NoopUI(no_color=True)
+            tools = ToolContext(workspace=root, ui=ui, auto_approve=True)
+            client = LabeledInlineDeleteClient()
+            agent = CodingAgent(client=client, tools=tools, ui=ui)
+
+            answer = agent.run("Delete both files.")
+
+            self.assertEqual(answer, "Done.")
+            self.assertEqual(client.calls, 3)
+            self.assertFalse((root / "script.py").exists())
+            self.assertFalse((root / "wiki_entry.txt").exists())
+            self.assertIn("Tool results", client.last_messages[-1]["content"])
+
+    def test_agent_executes_multiple_raw_tools_from_one_response(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            ui = NoopUI(no_color=True)
+            tools = ToolContext(workspace=root, ui=ui, auto_approve=True)
+            client = MultipleRawToolsClient()
+            agent = CodingAgent(client=client, tools=tools, ui=ui)
+
+            answer = agent.run("Create the Python and story files.")
+
+            self.assertEqual(answer, "Created `hello_random.py` and `story_random.txt`.")
+            self.assertEqual(client.calls, 2)
+            self.assertEqual(
+                (root / "hello_random.py").read_text(encoding="utf-8"),
+                'print("hello")\n',
+            )
+            self.assertEqual(
+                (root / "story_random.txt").read_text(encoding="utf-8"),
+                "Random numbers tell a deterministic story.\n",
+            )
 
     def test_agent_executes_valid_calls_when_other_block_is_malformed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1318,6 +1963,32 @@ class AgentLoopTests(unittest.TestCase):
             self.assertTrue(
                 any(
                     "File claim verification failed" in message["content"]
+                    for message in agent.messages
+                )
+            )
+
+    def test_agent_accepts_nested_file_claims_after_listing_their_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "folder"
+            folder.mkdir()
+            (folder / "script.py").write_text("print('ok')\n", encoding="utf-8")
+            (folder / "wiki_entry.txt").write_text("entry\n", encoding="utf-8")
+            ui = NoopUI(no_color=True)
+            tools = ToolContext(workspace=root, ui=ui)
+            client = NestedDirectoryListingClient()
+            agent = CodingAgent(client=client, tools=tools, ui=ui)
+
+            answer = agent.run("Confirm the generated files in folder.")
+
+            self.assertEqual(
+                answer,
+                "I created `script.py` and `wiki_entry.txt` in the directory.",
+            )
+            self.assertEqual(client.calls, 2)
+            self.assertFalse(
+                any(
+                    "File claim verification failed" in str(message.get("content", ""))
                     for message in agent.messages
                 )
             )

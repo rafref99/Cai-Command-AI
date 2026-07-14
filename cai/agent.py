@@ -1,21 +1,33 @@
 from __future__ import annotations
 
+import ast
 import json
 import re
 import shlex
+import time
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .providers import Message, ModelClient, ProviderError
+from .providers import Message, ModelClient, NativeToolCall, ProviderError, TokenUsage
 from .tools import ToolContext, ToolError
 from .tui import TerminalUI
 
 TOOL_BLOCK_PATTERNS = [
     re.compile(r"```(?:json\s+)?tool\s*(.*?)\s*```", re.DOTALL | re.IGNORECASE),
+    re.compile(
+        r"\btool\s+call\s*:\s*```json\s*(.*?)\s*```",
+        re.DOTALL | re.IGNORECASE,
+    ),
     re.compile(r"<tool>\s*(.*?)\s*</tool>", re.DOTALL | re.IGNORECASE),
     re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL | re.IGNORECASE),
 ]
+LABELED_INLINE_TOOL_CALL_PATTERN = re.compile(
+    r"^[ \t]*(?:tool[ \t]+call|earlier[ \t]+tool[ \t]+calls)[ \t]*:[ \t]*"
+    r"(?P<payload>[A-Za-z_][\w]*[ \t]*\(.*\))[ \t]*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 GEMMA_TOOL_CALL_MARKER = "<|tool_call>"
 GEMMA_TOOL_CALL_TERMINATOR = "<tool_call|>"
@@ -28,22 +40,29 @@ CONTENT_TOOL_NAMES = {
     "write_file",
 }
 RAW_CONTENT_TOOL_BLOCK_PATTERNS = [
+    # Canonical form: close the tool header fence, then open one content fence.
     re.compile(
-        r"```tool\s*"
-        r"(?P<header>(?:write_file|append_file|insert_lines|replace_lines|replace_symbol)\b[^\n`]*)\s*"
-        r"```(?:[A-Za-z0-9_+.-]+)?\n"
+        r"^```tool[ \t]*\r?\n"
+        r"(?P<header>"
+        r"(?:write_file|append_file|insert_lines|replace_lines|replace_symbol)\b[^\n`]*)"
+        r"[ \t]*\r?\n"
+        r"^```[ \t]*\r?\n"
+        r"^```(?:[A-Za-z0-9_+.-]+)?[ \t]*\r?\n"
         r"(?P<content>.*?)"
-        r"```\s*```",
-        re.DOTALL | re.IGNORECASE,
+        r"^```[ \t]*(?=\r?$)",
+        re.DOTALL | re.IGNORECASE | re.MULTILINE,
     ),
+    # Legacy nested form: the language fence also terminates the tool header.
     re.compile(
-        r"```tool\s*"
-        r"(?P<header>(?:write_file|append_file|insert_lines|replace_lines|replace_symbol)\b[^\n`]*)\s*"
-        r"```\s*"
-        r"```(?:[A-Za-z0-9_+.-]+)?\n"
+        r"^```tool[ \t]*\r?\n"
+        r"(?P<header>"
+        r"(?:write_file|append_file|insert_lines|replace_lines|replace_symbol)\b[^\n`]*)"
+        r"[ \t]*\r?\n"
+        r"^```(?:[A-Za-z0-9_+.-]+)?[ \t]*\r?\n"
         r"(?P<content>.*?)"
-        r"```",
-        re.DOTALL | re.IGNORECASE,
+        r"^```[ \t]*\r?\n"
+        r"^[ \t]*```[ \t]*(?=\r?$)",
+        re.DOTALL | re.IGNORECASE | re.MULTILINE,
     ),
 ]
 FENCED_WRITE_FILE_PATTERN = re.compile(
@@ -83,23 +102,82 @@ GEMMA_CONTENT_ARGUMENT_PATTERN = re.compile(
 
 FILE_CHANGE_VERBS = {
     "added",
+    "appended",
+    "changed",
+    "copied",
     "created",
     "deleted",
+    "edited",
     "generated",
+    "inserted",
     "modified",
     "removed",
+    "replaced",
     "saved",
     "updated",
     "wrote",
 }
 DELETE_VERBS = {"deleted", "removed"}
+MUTATING_TOOL_NAMES = {
+    "append_file",
+    "copy_file",
+    "create_dir",
+    "delete_path",
+    "insert_lines",
+    "move_path",
+    "replace_lines",
+    "replace_symbol",
+    "replace_text",
+    "write_file",
+}
+LINE_NUMBER_TOOL_NAMES = {"insert_lines", "replace_lines"}
 PATH_CLAIM_PATTERN = re.compile(r"`([^`\n]+)`|['\"]([^'\"\n]+)['\"]")
 VERB_PATTERN = re.compile(
     r"\b(" + "|".join(sorted(FILE_CHANGE_VERBS)) + r")\b",
     re.IGNORECASE,
 )
+DRY_RUN_VERB_PATTERN = re.compile(
+    r"\b(" + "|".join(sorted(FILE_CHANGE_VERBS | {"moved", "renamed"})) + r")\b",
+    re.IGNORECASE,
+)
 EXISTENCE_PHRASE_PATTERN = re.compile(
     r"\b(?:now in|saved in|located at|available at|stored at|written to)\s*$",
+    re.IGNORECASE,
+)
+READ_ONLY_REQUEST_PATTERN = re.compile(
+    r"\b(?:do\s+not|don't|dont|never)\s+"
+    r"(?:change|correct|create|delete|edit|generate|modify|patch|remove|rename|rewrite|"
+    r"touch|update|write)\b"
+    r"|\bwithout\s+(?:changing|correcting|creating|deleting|editing|generating|"
+    r"modifying|patching|removing|writing)\b"
+    r"|\b(?:change|edit|modify|touch|write)\s+no\s+(?:code|files?)\b"
+    r"|\bno\s+(?:changes?|edits?|modifications?)\b"
+    r"|\bread[- ]only\b",
+    re.IGNORECASE,
+)
+MUTATION_VERB_PATTERN = re.compile(
+    r"\b(?:add|build|change|correct|create|delete|edit|fix|generate|implement|improve|"
+    r"make|modify|optimize|overhaul|patch|refactor|remove|rename|repair|rewrite|update|"
+    r"write)\b",
+    re.IGNORECASE,
+)
+WORKSPACE_ARTIFACT_PATTERN = re.compile(
+    r"\b(?:app|application|bug|class|code|config(?:uration)?|docs?|documentation|"
+    r"feature|file|function|implementation|module|package|project|readme|repo(?:sitory)?|"
+    r"script|source|test(?:s| suite)?|tool|workspace)\b"
+    r"|(?:^|[\s'\"`])(?:[\w.-]+/)+[\w.-]+"
+    r"|\b[\w-]+\.(?:c|cc|cpp|css|go|h|hpp|html|ini|java|js|json|jsx|md|py|rs|sh|"
+    r"toml|ts|tsx|txt|yaml|yml)\b",
+    re.IGNORECASE,
+)
+INFORMATIONAL_OBJECT_PATTERN = re.compile(
+    r"\b(?:make|write|create)\s+(?:an?\s+|the\s+)?"
+    r"(?:analysis|explanation|list|recommendation|report|review|summary)\b",
+    re.IGNORECASE,
+)
+NO_CHANGE_ANSWER_PATTERN = re.compile(
+    r"\b(?:already (?:exists?|has|matches)|no changes? (?:are|is|were|was)?\s*"
+    r"(?:needed|required)?|nothing to (?:change|modify|update))\b",
     re.IGNORECASE,
 )
 
@@ -108,6 +186,13 @@ EXISTENCE_PHRASE_PATTERN = re.compile(
 class ToolCall:
     name: str
     arguments: dict[str, Any]
+    call_id: str = ""
+    raw_arguments: str = ""
+    parse_error: str = ""
+
+
+class AgentContextError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -138,6 +223,13 @@ class UnverifiedFileClaim:
     reason: str
 
 
+@dataclass(frozen=True)
+class ContextCompaction:
+    messages_compacted: int
+    before_chars: int
+    after_chars: int
+
+
 @dataclass
 class CodingAgent:
     client: ModelClient
@@ -147,6 +239,13 @@ class CodingAgent:
     messages: list[Message] = field(default_factory=list)
     last_tool_errors: list[str] = field(default_factory=list)
     show_thinking: bool = False
+    max_context_chars: int = 48_000
+    completion_status: str = "idle"
+    last_model_input_chars: int = 0
+    last_usage: TokenUsage = field(default_factory=TokenUsage)
+    total_usage: TokenUsage = field(default_factory=TokenUsage)
+    _context_floor: int = field(init=False, default=1, repr=False)
+    _context_summary: str = field(init=False, default="", repr=False)
 
     def __post_init__(self) -> None:
         if not self.messages:
@@ -159,7 +258,39 @@ class CodingAgent:
 
     def run(self, user_text: str) -> str:
         self.last_tool_errors = []
+        self.last_usage = TokenUsage()
+        context_limit = max(self.max_context_chars, 8_000)
+        minimum_request = [
+            _sanitize_message(self.messages[0]),
+            {"role": "user", "content": user_text},
+        ]
+        minimum_chars = _message_chars(minimum_request)
+        if minimum_chars > context_limit:
+            self.completion_status = "incomplete"
+            error = (
+                f"The request needs approximately {minimum_chars} context characters, "
+                f"but the configured limit is {context_limit}. Shorten the request or "
+                "increase --max-context-chars."
+            )
+            self.last_tool_errors.append(f"ERROR: {error}")
+            answer = f"Request not sent: {error}"
+            self.messages.extend(
+                [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": answer},
+                ]
+            )
+            return answer
+        self.completion_status = "running"
+        task_start = len(self.messages)
         self.messages.append({"role": "user", "content": user_text})
+        previous_failed_calls: set[str] = set()
+        change_required = _task_requests_workspace_change(user_text)
+        successful_mutation_calls = 0
+        verified_noop_mutation_calls = 0
+        completion_repair_sent = False
+        verified_paths: set[Path] = set()
+        verified_directories: set[Path] = {self.tools.workspace}
 
         for round_index in range(1, self.max_tool_rounds + 1):
             self.ui.status(
@@ -172,13 +303,28 @@ class CodingAgent:
             )
             on_delta = self.ui.stream_delta if self.show_thinking else None
             try:
-                assistant_text = self.client.complete(self.messages, on_delta=on_delta)
+                try:
+                    response = self._complete(task_start, on_delta=on_delta)
+                except AgentContextError as exc:
+                    error = str(exc)
+                    self.last_tool_errors.append(f"ERROR: {error}")
+                    self.completion_status = "incomplete"
+                    final = f"Stopped because the context limit was reached: {error}"
+                    self.messages.append({"role": "assistant", "content": final})
+                    return final
             finally:
                 if self.show_thinking:
                     self.ui.stream_end()
+            assistant_text = str(response)
             self.ui.status("Working: parsing assistant response")
-            parsed = parse_tool_response(assistant_text)
-            calls = parsed.calls
+            native_calls = tuple(getattr(response, "tool_calls", ()))
+            parsed = ToolParseResult()
+            calls: list[ToolCall]
+            if native_calls:
+                calls = _tool_calls_from_native(native_calls, round_index)
+            else:
+                parsed = parse_tool_response(assistant_text)
+                calls = parsed.calls
             visible = strip_tool_blocks(assistant_text).strip()
             visible_shown = False
 
@@ -213,61 +359,194 @@ class CodingAgent:
                 unverified_claims = find_unverified_file_claims(
                     assistant_text,
                     self.tools.workspace,
+                    dry_run=self.tools.dry_run,
+                    known_paths=verified_paths,
+                    known_directories=verified_directories,
                 )
                 if unverified_claims:
                     error_text = format_unverified_file_claims(unverified_claims)
                     self.ui.panel("Unverified file claim", error_text, "yellow")
                     self.messages.append({"role": "assistant", "content": assistant_text})
+                    if self.tools.dry_run:
+                        correction = (
+                            "Dry-run previews do not change the workspace. Rephrase the final "
+                            "answer as proposed changes using 'would change'. Do not call more "
+                            "mutation tools just to make these paths exist."
+                        )
+                    else:
+                        correction = (
+                            "Use tools to actually create, modify, remove, or verify the named "
+                            "paths before making this claim again."
+                        )
                     self.messages.append(
                         {
                             "role": "user",
                             "content": (
                                 "File claim verification failed:\n"
                                 f"{error_text}\n\n"
-                                "Use tools to actually create, modify, remove, or verify the "
-                                "named paths before making this claim again."
+                                f"{correction}"
                             ),
                         }
                     )
                     continue
+                no_change_verified = bool(
+                    verified_noop_mutation_calls
+                    and NO_CHANGE_ANSWER_PATTERN.search(assistant_text)
+                )
+                if (
+                    change_required
+                    and successful_mutation_calls == 0
+                    and not no_change_verified
+                ):
+                    self.messages.append({"role": "assistant", "content": assistant_text})
+                    if completion_repair_sent:
+                        error = (
+                            "The task requested workspace changes, but no mutation tool "
+                            "completed after a repair request."
+                        )
+                        self.last_tool_errors.append(f"ERROR: {error}")
+                        self.completion_status = "incomplete"
+                        return assistant_text
+                    self.messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "COMPLETION CHECK: The original request asks for workspace "
+                                "changes, but no file mutation tool has succeeded. Make the "
+                                "requested changes now, or clearly explain the concrete blocker."
+                            ),
+                        }
+                    )
+                    completion_repair_sent = True
+                    continue
                 self.messages.append({"role": "assistant", "content": assistant_text})
+                self.completion_status = "completed"
                 return assistant_text
 
             if visible and not visible_shown:
                 self.ui.panel("Assistant", visible, "magenta")
-            self.messages.append({"role": "assistant", "content": assistant_text})
+            if native_calls:
+                self.messages.append(_native_assistant_message(assistant_text, calls))
+            else:
+                self.messages.append({"role": "assistant", "content": assistant_text})
             tool_results = [*parse_error_results]
+            failed_this_round: set[str] = set()
+            batch_failed = bool(parsed.errors)
+            mutated_paths: set[str] = set()
+            workspace_changed_this_round = False
             for call in calls:
-                self.ui.status(f"Working: {call.name}")
-                try:
-                    result = self.tools.execute(call.name, call.arguments)
-                    self.ui.panel(f"Tool result: {call.name}", result, "blue")
-                except (ToolError, ProviderError) as exc:
-                    result = f"ERROR: {exc}"
+                started_at = time.perf_counter()
+                signature = _tool_call_signature(call)
+                ok = False
+                deferred = False
+                if call.parse_error:
+                    result = _limit_tool_feedback(
+                        f"ERROR: {call.parse_error}",
+                        self.tools.max_output_chars,
+                    )
+                elif batch_failed and _tool_call_may_mutate(call):
+                    result = (
+                        "ERROR: skipped this mutation because an earlier call in the same "
+                        "response failed. Review the results and retry it next round."
+                    )
+                    deferred = True
+                elif (
+                    call.name in LINE_NUMBER_TOOL_NAMES
+                    and _canonical_tool_path(call, self.tools) in mutated_paths
+                ):
+                    result = (
+                        "ERROR: skipped a second line-number edit to the same file in one "
+                        "response because the earlier edit made its line numbers stale. "
+                        "Read the updated range and retry next round."
+                    )
+                    deferred = True
+                elif signature in previous_failed_calls and not workspace_changed_this_round:
+                    result = (
+                        "ERROR: unchanged retry skipped because this exact call failed in "
+                        "the previous round. Change its arguments or use another approach."
+                    )
+                else:
+                    try:
+                        result = self.tools.execute(call.name, call.arguments)
+                        ok = _tool_result_succeeded(call.name, result)
+                        if ok:
+                            evidence_paths, evidence_directories = _tool_path_evidence(
+                                call,
+                                self.tools,
+                            )
+                            verified_paths.update(evidence_paths)
+                            verified_directories.update(evidence_directories)
+                        if ok and _tool_call_may_mutate(call):
+                            if _tool_result_changed(result):
+                                successful_mutation_calls += 1
+                                mutated_paths.update(
+                                    _tool_mutation_paths(call, self.tools)
+                                )
+                                workspace_changed_this_round = True
+                            else:
+                                verified_noop_mutation_calls += 1
+                    except (ToolError, ProviderError) as exc:
+                        result = _limit_tool_feedback(
+                            f"ERROR: {exc}",
+                            self.tools.max_output_chars,
+                        )
+                self.ui.tool_activity(
+                    call.name,
+                    call.arguments,
+                    result,
+                    ok=ok,
+                    elapsed=max(
+                        time.perf_counter()
+                        - started_at
+                        - self.tools.last_approval_wait_seconds,
+                        0.0,
+                    ),
+                )
+                if not ok:
+                    batch_failed = True
+                    if not deferred:
+                        failed_this_round.add(signature)
                     self.last_tool_errors.append(result)
-                    self.ui.panel(f"Tool error: {call.name}", result, "red")
                 tool_results.append(
                     {
                         "name": call.name,
                         "arguments": summarize_tool_arguments(call.arguments),
                         "result": result,
+                        "ok": ok,
+                        "call_id": call.call_id,
                     }
                 )
 
-            self.messages.append(
-                {
-                    "role": "user",
-                    "content": "Tool results:\n"
-                    + json.dumps(tool_results, indent=2, ensure_ascii=False),
-                }
-            )
+            if native_calls:
+                for call_index, tool_result in enumerate(
+                    tool_results[-len(calls) :],
+                    start=1,
+                ):
+                    call_id = str(
+                        tool_result.get("call_id") or f"call_{round_index}_{call_index}"
+                    )
+                    self.messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "name": tool_result["name"],
+                            "content": str(tool_result["result"]),
+                        }
+                    )
+            else:
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": format_tool_results(
+                            tool_results,
+                            round_index=round_index,
+                            max_rounds=self.max_tool_rounds,
+                        ),
+                    }
+                )
+            previous_failed_calls = failed_this_round
 
-        final = (
-            "Stopped because the model reached the maximum number of tool rounds. "
-            "Ask me to continue if you want another pass."
-        )
-        self.messages.append({"role": "assistant", "content": final})
-        return final
+        return self._finalize_after_tool_limit(task_start)
 
     def reset(self) -> None:
         self.messages = [
@@ -276,10 +555,50 @@ class CodingAgent:
                 "content": self._build_system_prompt(),
             }
         ]
+        self._context_floor = 1
+        self._context_summary = ""
+        self.completion_status = "idle"
+
+    def compact_context(self) -> ContextCompaction:
+        """Replace completed model history with a bounded deterministic summary.
+
+        The transcript in ``messages`` remains untouched. Only the history sent
+        with subsequent model requests changes.
+        """
+
+        completed = _compact_completed_messages(
+            self.messages[self._context_floor :]
+        )
+        source: list[Message] = []
+        if self._context_summary:
+            source.append({"role": "user", "content": self._context_summary})
+        source.extend(completed)
+        before_chars = _message_chars(source) if source else 0
+        if not completed:
+            return ContextCompaction(0, before_chars, before_chars)
+
+        summary_limit = max(1_000, min(6_000, self.max_context_chars // 6))
+        self._context_summary = _build_context_summary(source, summary_limit)
+        self._context_floor = len(self.messages)
+        after_chars = _message_chars(
+            [{"role": "user", "content": self._context_summary}]
+        )
+        return ContextCompaction(len(completed), before_chars, after_chars)
 
     def set_workspace(self, workspace: Path) -> None:
         self.tools.set_workspace(workspace)
         self._refresh_system_prompt()
+        # Keep the full transcript, but never send file/tool context from the old
+        # workspace to the model after a /cd boundary.
+        self._context_floor = len(self.messages)
+        self._context_summary = ""
+
+    def set_model(self, model: str) -> None:
+        selected = model.strip()
+        if not selected:
+            raise ValueError("Model name must not be empty.")
+        self.client.model = selected
+        self.completion_status = "idle"
 
     def _refresh_system_prompt(self) -> None:
         prompt = self._build_system_prompt()
@@ -293,121 +612,768 @@ class CodingAgent:
         return build_system_prompt(
             self.tools.workspace,
             native_tools=bool(getattr(self.client, "native_tools", False)),
+            dry_run=self.tools.dry_run,
         )
 
+    def _complete(
+        self,
+        task_start: int,
+        *,
+        on_delta: Any = None,
+    ) -> str:
+        model_messages = self._messages_for_model(task_start)
+        self.last_model_input_chars = _message_chars(model_messages)
+        response = self.client.complete(model_messages, on_delta=on_delta)
+        usage = getattr(response, "usage", None)
+        if isinstance(usage, TokenUsage):
+            self.last_usage = self.last_usage + usage
+            self.total_usage = self.total_usage + usage
+        return response
+
+    def _messages_for_model(self, task_start: int) -> list[Message]:
+        system = _sanitize_message(self.messages[0])
+        prior: list[Message] = []
+        if self._context_summary:
+            prior.append({"role": "user", "content": self._context_summary})
+        prior.extend(
+            _compact_completed_messages(
+                self.messages[self._context_floor : task_start]
+            )
+        )
+        active = [_sanitize_message(message) for message in self.messages[task_start:]]
+        context_limit = max(self.max_context_chars, 8_000)
+        model_messages = _fit_model_context(
+            system,
+            prior,
+            active,
+            max_chars=context_limit,
+        )
+        rendered_chars = _message_chars(model_messages)
+        if rendered_chars > context_limit:
+            raise AgentContextError(
+                "The current task context cannot fit within the configured "
+                f"{context_limit}-character limit (needs approximately "
+                f"{rendered_chars}). Increase --max-context-chars or start a shorter task."
+            )
+        return model_messages
+
+    def _finalize_after_tool_limit(self, task_start: int) -> str:
+        limit_error = (
+            f"Tool round limit reached ({self.max_tool_rounds}) before normal completion."
+        )
+        self.last_tool_errors.append(f"ERROR: {limit_error}")
+        self.completion_status = "incomplete"
+        self.messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "TOOL BUDGET EXHAUSTED. Do not call more tools. Give a concise, honest "
+                    "summary of verified work, failed checks, and anything still unfinished."
+                ),
+            }
+        )
+        self.ui.status("Reasoning: requesting a final summary")
+        try:
+            response = self._complete(task_start)
+        except AgentContextError as exc:
+            error = str(exc)
+            self.last_tool_errors.append(f"ERROR: {error}")
+            text = (
+                f"Stopped after {self.max_tool_rounds} tool rounds, and the final summary "
+                f"could not fit the context budget: {error}"
+            )
+            self.messages.append({"role": "assistant", "content": text})
+            return text
+        text = strip_tool_blocks(str(response)).strip()
+        requested_more_tools = bool(getattr(response, "tool_calls", ())) or bool(
+            parse_tool_response(str(response)).calls
+        )
+        if requested_more_tools or not text:
+            text = (
+                f"Stopped after {self.max_tool_rounds} tool rounds. The model still "
+                "requested tool work, so the task may be incomplete. Run the task again "
+                "to continue from the current workspace state."
+            )
+        self.messages.append({"role": "assistant", "content": text})
+        return text
+
     def _tool_repair_message(self, error_text: str) -> str:
-        prefix = f"Tool call parse errors:\n{error_text}\n\nPlease try again. "
+        prefix = f"Tool call parse errors:\n{error_text}\n\nRetry only the failed call. "
         if bool(getattr(self.client, "native_tools", False)):
             return (
                 prefix
-                + "Use the provider-native function-calling interface and pass arguments "
-                "that match the tool schema. Do not print the call as JSON or XML."
+                + "Use the native function interface with schema-valid arguments."
             )
         return (
             prefix
-            + "For write_file, append_file, insert_lines, replace_lines, or replace_symbol "
-            "with source code, do not use Gemma <|tool_call> syntax or JSON string escaping. "
-            "Use this raw format exactly:\n\n"
+            + "For multiline edit content, use this raw format instead of escaped JSON:\n\n"
             "```tool\n"
-            "write_file path=\"tic/main.py\"\n"
+            "write_file path=\"src/app.py\"\n"
             "```\n"
             "```python\n"
             "print(\"hello\")\n"
             "```\n\n"
-            "For other tools, emit valid JSON inside each tool block."
+            "For other tools, emit one valid JSON tool block."
         )
 
 
-def build_system_prompt(workspace: Path, *, native_tools: bool = False) -> str:
+def build_system_prompt(
+    workspace: Path,
+    *,
+    native_tools: bool = False,
+    dry_run: bool = False,
+) -> str:
+    workflow = f"""You are Cai, a terminal coding agent working in this workspace:
+{workspace}
+
+Complete the user's actual task; do not stop after describing a plan.
+
+Efficient work loop:
+1. Locate relevant files with list_files or search. Read only the ranges you need.
+2. Reuse results from unchanged files. Batch independent inspection calls.
+3. Prefer replace_text for a small exact edit and write_file for a new or complete file.
+   Use line/symbol tools only when they make the edit safer.
+4. Run the narrowest useful check after editing. If it fails, fix the cause and rerun it.
+5. Finish with a short summary of changes and verification.
+
+Treat tool output as evidence. Never invent file contents or claim a change that a tool did
+not confirm. Do not repeat a successful call without a concrete reason. A shell call starts
+fresh in the workspace, so use one complete command rather than relying on a prior cd.
+"""
+    if dry_run:
+        workflow += (
+            "\nDRY RUN IS ENABLED: tools only preview mutations. Describe proposed changes "
+            "as 'would change'; never claim that previewed files were actually changed.\n"
+        )
+
     if native_tools:
-        tool_protocol = """Provider-native function tools are enabled. Call tools through the
-provider's function-calling interface. Do not print a tool call as JSON, XML, or a fenced
-code block when the native interface is available.
+        return (
+            workflow
+            + """
+Provider-native function tools are enabled. Call them only through the function interface.
+Do not print a tool call as JSON, XML, Gemma markers, or fenced code. Tool schemas are the
+source of truth for arguments. After tool results, continue the original task.
+"""
+        )
 
-If the provider does not expose the native interface for a response, use this fenced
-fallback syntax and no unsupported schema:"""
-    else:
-        tool_protocol = """You can inspect and modify the local workspace by calling tools.
-To call a tool, emit one or more fenced tool blocks and no unsupported schema:"""
-
-    return f"""You are Cai, a terminal-first coding agent for local programming work.
-
-Workspace: {workspace}
-
-{tool_protocol}
+    return (
+        workflow
+        + """
+Call a tool with a fenced JSON block:
 
 ```tool
-{{"name": "read_file", "arguments": {{"path": "pyproject.toml"}}}}
+{"name":"read_file","arguments":{"path":"pyproject.toml"}}
 ```
 
-For fenced fallback calls with multi-line file content, avoid putting source code
-inside JSON. Use this raw-content format instead:
+For multiline content, avoid JSON escaping. Use a tool header followed by one content fence:
 
 ```tool
-write_file path="tic/main.py"
+write_file path="src/app.py"
 ```
 ```python
 print("hello")
 ```
 
-When using the fenced fallback, do not use Gemma `<|tool_call>` syntax for
-multi-line source code content. It is too easy to leave quotes or braces
-unterminated. Use raw-content fenced tool blocks for write_file, append_file,
-insert_lines, replace_lines, and replace_symbol whenever content spans multiple
-lines.
+Use that raw-content form for write_file, append_file, insert_lines, replace_lines, and
+replace_symbol. Otherwise use valid JSON. Emit tool calls, not prose that imitates a result.
 
-For localized edits after reading a file with line numbers, prefer replacing
-only the affected lines instead of rewriting the whole file:
+Primary tools (usually sufficient):
+- list_files(path=".", max_results=200)
+- search(pattern, path=".", max_results=120)
+- read_file(path, start_line=1, max_lines=240)
+- replace_text(path, old, new, replace_all=false)
+- write_file(path, content)
+- run_shell(command, timeout_seconds optional)
 
-```tool
-replace_lines path="tic/main.py" start_line=50 end_line=68
-```
-```python
-def draw_player_mark(row, col, player):
-    ...
-```
+Specialized tools:
+- file_info(path), create_dir(path), append_file(path, content)
+- insert_lines(path, after_line, content), replace_lines(path, start_line, end_line, content,
+  to_eof=false)
+- python_symbols(path), replace_symbol(path, name, content, kind="any")
+- python_syntax_check(path), copy_file(source, destination), move_path(source, destination)
+- delete_path(path, recursive=false)
 
-If line numbers are stale or unreliable, use python_symbols to find functions
-and classes, then replace_symbol by name instead of guessing a range.
-
-After tool results are returned, continue working until the user's request is
-handled or you need a human decision. Use small, concrete steps. Prefer reading
-files before editing them. Use write_file for new files, append_file or
-insert_lines for additions, replace_lines for localized line-range changes,
-replace_symbol when editing a Python function or class by name, replace_text
-for exact small replacements, and python_syntax_check before rerunning Python
-programs when syntax may be broken. Do not claim you changed files unless a
-tool result confirms it.
-
-Before the final answer, verify named files or directories you claim to have
-created or modified actually exist. If they do not, keep using tools instead of
-claiming success.
-
-Each `run_shell` call starts in the workspace as a fresh shell. Do not rely on
-`cd` persisting across tool calls; use paths like `tic/main.py` or one complete
-command such as `mkdir -p tic && python3 tic/main.py`.
-
-Available tools:
-- list_files: {{"path": ".", "max_results": 200}}
-- file_info: {{"path": "file-or-directory"}}
-- read_file: {{"path": "file", "start_line": 1, "max_lines": 240, "max_bytes": 1000000}}
-- create_dir: {{"path": "directory"}}
-- write_file: {{"path": "file", "content": "the complete desired file content"}}
-- append_file: {{"path": "file", "content": "content to append"}}
-- insert_lines: {{"path": "file", "after_line": 10, "content": "inserted lines"}}
-- replace_lines: {{"path": "file", "start_line": 10, "end_line": 20, "content": "text"}}
-- replace_text: {{"path": "file", "old": "exact text", "new": "replacement", "replace_all": false}}
-- python_symbols: {{"path": "file.py"}}
-- replace_symbol: {{"path": "file.py", "name": "function_name", "content": "block"}}
-- copy_file: {{"source": "file", "destination": "file"}}
-- move_path: {{"source": "path", "destination": "path"}}
-- delete_path: {{"path": "path", "recursive": false}}
-- search: {{"pattern": "regex", "path": ".", "max_results": 120, "max_file_bytes": 1000000}}
-- python_syntax_check: {{"path": "file.py"}}
-- run_shell: {{"command": "command", "timeout_seconds": 60, "max_output_chars": 12000}}
-
-When you are done, answer plainly with what changed and how it was verified.
+After each TOOL RESULTS message, continue the original request or give the final answer.
 """
+    )
+
+
+def _tool_calls_from_native(
+    native_calls: tuple[NativeToolCall, ...],
+    round_index: int,
+) -> list[ToolCall]:
+    calls: list[ToolCall] = []
+    for index, call in enumerate(native_calls, start=1):
+        calls.append(
+            ToolCall(
+                name=call.name,
+                arguments=call.arguments or {},
+                call_id=call.id or f"call_{round_index}_{index}",
+                raw_arguments=call.raw_arguments,
+                parse_error=call.parse_error or "",
+            )
+        )
+    return calls
+
+
+def _native_assistant_message(content: str, calls: list[ToolCall]) -> Message:
+    return {
+        "role": "assistant",
+        "content": content or None,
+        "tool_calls": [
+            {
+                "id": call.call_id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": call.raw_arguments
+                    or json.dumps(call.arguments, ensure_ascii=False, separators=(",", ":")),
+                },
+            }
+            for call in calls
+        ],
+    }
+
+
+def _tool_call_signature(call: ToolCall) -> str:
+    try:
+        arguments = json.dumps(call.arguments, sort_keys=True, ensure_ascii=False)
+    except (TypeError, ValueError):
+        arguments = repr(call.arguments)
+    return f"{call.name}:{arguments}:{call.parse_error}"
+
+
+def _tool_result_succeeded(name: str, result: str) -> bool:
+    if result.startswith("ERROR:"):
+        return False
+    if result.startswith("DRY RUN:"):
+        return True
+    if name == "python_syntax_check" and result.startswith("Syntax error"):
+        return False
+    if name == "run_shell":
+        match = re.search(r"(?m)^exit_code:\s*(-?\d+)\s*$", result)
+        return match is not None and match.group(1) == "0"
+    return True
+
+
+def _tool_result_changed(result: str) -> bool:
+    if result.startswith("DRY RUN:"):
+        return True
+    return not result.startswith(
+        (
+            "No changes:",
+            "Directory already exists:",
+            "Path already absent:",
+        )
+    )
+
+
+def _tool_call_may_mutate(call: ToolCall) -> bool:
+    if call.name in MUTATING_TOOL_NAMES:
+        return True
+    if call.name != "run_shell":
+        return False
+    command = str(call.arguments.get("command", ""))
+    return bool(
+        re.search(
+            r"(?:^|[;&|]\s*)(?:chmod|chown|cp|install|ln|mkdir|mv|rm|rmdir|touch|"
+            r"truncate)\b|\b(?:perl\s+-pi|sed\s+-i)\b|(?:^|\s)(?:>>?|tee\s)",
+            command,
+        )
+        or re.search(
+            r"\b(?:black|gofmt|isort)\b|\bcargo\s+fmt\b|\bgo\s+fmt\b|"
+            r"\bgit\s+apply\b|\b(?:npm|pnpm|yarn)\s+(?:ci|install)\b|"
+            r"\bprettier\b[^;&|]*\s--write\b|"
+            r"\bruff\s+(?:format\b|check\b[^;&|]*\s--fix\b)",
+            command,
+        )
+    )
+
+
+def _canonical_tool_path(call: ToolCall, tools: ToolContext) -> str:
+    value = call.arguments.get("path")
+    if not isinstance(value, str) or not value:
+        return ""
+    try:
+        return str(tools.resolve_path(value))
+    except ToolError:
+        return value
+
+
+def _tool_mutation_paths(call: ToolCall, tools: ToolContext) -> set[str]:
+    if call.name in {"copy_file", "move_path"}:
+        keys = ("source", "destination") if call.name == "move_path" else ("destination",)
+    elif call.name in MUTATING_TOOL_NAMES:
+        keys = ("path",)
+    else:
+        return set()
+    paths: set[str] = set()
+    for key in keys:
+        value = call.arguments.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            paths.add(str(tools.resolve_path(value)))
+        except ToolError:
+            paths.add(value)
+    return paths
+
+
+def _tool_path_evidence(
+    call: ToolCall,
+    tools: ToolContext,
+) -> tuple[set[Path], set[Path]]:
+    """Collect path context established by one successful tool call."""
+
+    paths: set[Path] = set()
+    directories: set[Path] = set()
+    if call.name in {"list_files", "search"}:
+        raw_path = call.arguments.get("path", ".")
+        if isinstance(raw_path, str) and raw_path:
+            try:
+                directories.add(tools.resolve_path(raw_path))
+            except ToolError:
+                pass
+    elif call.name in {
+        "append_file",
+        "file_info",
+        "insert_lines",
+        "python_symbols",
+        "python_syntax_check",
+        "read_file",
+        "replace_lines",
+        "replace_symbol",
+        "replace_text",
+        "write_file",
+    }:
+        raw_path = call.arguments.get("path")
+        if isinstance(raw_path, str) and raw_path:
+            try:
+                paths.add(tools.resolve_path(raw_path))
+            except ToolError:
+                pass
+    elif call.name in {"copy_file", "move_path"}:
+        for key in ("source", "destination"):
+            raw_path = call.arguments.get(key)
+            if not isinstance(raw_path, str) or not raw_path:
+                continue
+            try:
+                paths.add(tools.resolve_path(raw_path))
+            except ToolError:
+                pass
+    elif call.name == "create_dir":
+        raw_path = call.arguments.get("path")
+        if isinstance(raw_path, str) and raw_path:
+            try:
+                directories.add(tools.resolve_path(raw_path))
+            except ToolError:
+                pass
+    elif call.name == "run_shell":
+        command = call.arguments.get("command")
+        if isinstance(command, str):
+            shell_paths, shell_directories = _simple_ls_path_evidence(command, tools)
+            paths.update(shell_paths)
+            directories.update(shell_directories)
+    return paths, directories
+
+
+def _simple_ls_path_evidence(
+    command: str,
+    tools: ToolContext,
+) -> tuple[set[Path], set[Path]]:
+    """Recognize path operands from a plain, successful ``ls`` command."""
+
+    try:
+        arguments = shlex.split(command)
+    except ValueError:
+        return set(), set()
+    if not arguments or Path(arguments[0]).name != "ls":
+        return set(), set()
+    operands: list[str] = []
+    options_done = False
+    for argument in arguments[1:]:
+        if not options_done and argument == "--":
+            options_done = True
+            continue
+        if not options_done and argument.startswith("-"):
+            continue
+        operands.append(argument)
+    if not operands:
+        operands.append(".")
+
+    paths: set[Path] = set()
+    directories: set[Path] = set()
+    for operand in operands:
+        try:
+            resolved = tools.resolve_path(operand)
+        except ToolError:
+            continue
+        if resolved.is_dir():
+            directories.add(resolved)
+        else:
+            paths.add(resolved)
+    return paths, directories
+
+
+def _task_requests_workspace_change(text: str) -> bool:
+    normalized = " ".join(text.lower().split())
+    if not normalized:
+        return False
+    if READ_ONLY_REQUEST_PATTERN.search(normalized):
+        return False
+    informational_prefixes = (
+        "analyze ",
+        "audit ",
+        "describe ",
+        "explain ",
+        "how ",
+        "inspect ",
+        "review ",
+        "show ",
+        "summarize ",
+        "tell ",
+        "what ",
+        "why ",
+    )
+    explicit_follow_up = re.search(
+        r"\b(?:and|then)\s+(?:add|build|change|correct|create|delete|edit|fix|generate|"
+        r"implement|improve|make|modify|move|optimize|patch|refactor|remove|rename|"
+        r"repair|rewrite|update|write)\b",
+        normalized,
+    )
+    request = re.sub(
+        r"^(?:please\s+|(?:can|could|would)\s+you\s+)",
+        "",
+        normalized,
+    )
+    if request.startswith(informational_prefixes) and explicit_follow_up is None:
+        return False
+    if explicit_follow_up is None and re.search(
+        r"\b(?:describe|explain|show|tell(?:\s+me)?)\s+(?:me\s+)?how\s+to\b",
+        normalized,
+    ):
+        return False
+    if INFORMATIONAL_OBJECT_PATTERN.search(normalized) and explicit_follow_up is None:
+        return False
+    return bool(
+        MUTATION_VERB_PATTERN.search(normalized)
+        and WORKSPACE_ARTIFACT_PATTERN.search(normalized)
+    )
+
+
+def format_tool_results(
+    results: list[dict[str, Any]],
+    *,
+    round_index: int,
+    max_rounds: int,
+) -> str:
+    """Render results for text-only models without JSON-escaping entire outputs."""
+
+    lines = [f"Tool results (round {round_index}/{max_rounds}):"]
+    any_failed = False
+    for index, item in enumerate(results, start=1):
+        result = str(item.get("result", ""))
+        ok = bool(item.get("ok", not result.startswith("ERROR:")))
+        any_failed = any_failed or not ok
+        arguments = item.get("arguments", {})
+        rendered_arguments = json.dumps(
+            arguments,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        lines.extend(
+            [
+                f"\n{index}. {item.get('name', 'tool')}({rendered_arguments})",
+                f"status: {'ok' if ok else 'error'}",
+                "output:",
+                result or "(empty)",
+            ]
+        )
+    if any_failed:
+        next_step = (
+            "Correct failed calls using the error text. Do not repeat successful or "
+            "unchanged failed calls."
+        )
+    else:
+        next_step = "Use these results and take only the next necessary action."
+    lines.extend(
+        [
+            "",
+            "NEXT: Continue the original user request. " + next_step,
+            "If the task is complete, answer with the changes and verification; do not call tools.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _sanitize_message(message: Message) -> Message:
+    allowed = {"role", "content", "name", "tool_calls", "tool_call_id"}
+    return {key: value for key, value in message.items() if key in allowed}
+
+
+def _is_internal_user_message(message: Message) -> bool:
+    if message.get("role") != "user":
+        return False
+    content = str(message.get("content") or "")
+    return content.startswith(
+        (
+            "Tool results (round ",
+            "TOOL CALL ERROR",
+            "Tool call parse errors",
+            "File claim verification failed:",
+            "COMPLETION CHECK:",
+            "TOOL BUDGET EXHAUSTED",
+        )
+    )
+
+
+def _compact_completed_messages(messages: list[Message]) -> list[Message]:
+    """Keep prior user turns and final answers, not their completed tool traces."""
+
+    compact: list[Message] = []
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "tool" or _is_internal_user_message(message):
+            continue
+        if role == "assistant":
+            if message.get("tool_calls"):
+                continue
+            next_message = messages[index + 1] if index + 1 < len(messages) else None
+            if next_message is not None and _is_internal_user_message(next_message):
+                continue
+        compact.append(_sanitize_message(message))
+    return compact
+
+
+def _build_context_summary(messages: list[Message], max_chars: int) -> str:
+    """Build a bounded recent-history summary without another provider request."""
+
+    prefix = "Compacted session context (the full transcript is still available):"
+    available = max(max_chars - len(prefix) - 2, 1)
+    entries: list[str] = []
+    for message in messages:
+        role = str(message.get("role") or "message").capitalize()
+        content = str(message.get("content") or "").strip()
+        if not content:
+            continue
+        entries.append(f"{role}: {content}")
+
+    retained: list[str] = []
+    used = 0
+    omitted = False
+    for entry in reversed(entries):
+        separator_size = 2 if retained else 0
+        remaining = available - used - separator_size
+        if remaining <= 0:
+            omitted = True
+            break
+        if len(entry) > remaining:
+            retained.append(_truncate_context_text(entry, remaining))
+            used = available
+            omitted = True
+            break
+        retained.append(entry)
+        used += separator_size + len(entry)
+    retained.reverse()
+    if len(retained) < len(entries):
+        omitted = True
+
+    body = "\n\n".join(retained)
+    if omitted:
+        omission = "[Older compacted details omitted.]"
+        if len(omission) + 2 + len(body) <= available:
+            body = f"{omission}\n\n{body}" if body else omission
+    return f"{prefix}\n\n{body}".rstrip()
+
+
+def _active_message_groups(messages: list[Message]) -> list[tuple[list[Message], bool]]:
+    groups: list[tuple[list[Message], bool]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        role = message.get("role")
+        if role == "assistant" and message.get("tool_calls"):
+            group = [message]
+            index += 1
+            while index < len(messages) and messages[index].get("role") == "tool":
+                group.append(messages[index])
+                index += 1
+            groups.append((group, True))
+            continue
+        if role == "assistant" and index + 1 < len(messages):
+            next_message = messages[index + 1]
+            if _is_internal_user_message(next_message):
+                groups.append(([message, next_message], True))
+                index += 2
+                continue
+        groups.append(([message], _is_internal_user_message(message)))
+        index += 1
+    return groups
+
+
+def _fit_model_context(
+    system: Message,
+    prior: list[Message],
+    active: list[Message],
+    *,
+    max_chars: int,
+) -> list[Message]:
+    """Bound model history while retaining the current task and newest evidence."""
+
+    retained_prior = list(prior)
+    groups = _active_message_groups(active)
+    dropped = False
+    compact_limit = max(1_000, min(4_000, max_chars // 6))
+
+    # Once a tool has executed, its large arguments are redundant. Keep the full
+    # transcript in self.messages, but send the model a compact call summary and
+    # the complete bounded result on the follow-up.
+    for index, (group, droppable) in enumerate(list(groups)):
+        if droppable and group and group[0].get("role") == "assistant":
+            groups[index] = (
+                [_compact_history_message(group[0], compact_limit), *group[1:]],
+                True,
+            )
+
+    def render() -> list[Message]:
+        flattened = [message for group, _ in groups for message in group]
+        if dropped and flattened:
+            flattened.insert(
+                1,
+                {
+                    "role": "user",
+                    "content": (
+                        "CONTEXT NOTE: Older tool exchanges were omitted to stay within "
+                        "the context budget. Re-read any detail you still need."
+                    ),
+                },
+            )
+        return [system, *retained_prior, *flattened]
+
+    while retained_prior and _message_chars(render()) > max_chars:
+        removed = retained_prior.pop(0)
+        if removed.get("role") == "user":
+            while retained_prior and retained_prior[0].get("role") == "assistant":
+                retained_prior.pop(0)
+        dropped = True
+
+    while _message_chars(render()) > max_chars:
+        removable_index = next(
+            (
+                index
+                for index, (_, droppable) in enumerate(groups[:-2])
+                if droppable and index != 0
+            ),
+            None,
+        )
+        if removable_index is None:
+            break
+        groups.pop(removable_index)
+        dropped = True
+
+    for index, (group, droppable) in enumerate(list(groups)):
+        if _message_chars(render()) <= max_chars:
+            break
+        if droppable:
+            groups[index] = (
+                [_compact_history_message(message, compact_limit) for message in group],
+                True,
+            )
+            dropped = True
+
+    while _message_chars(render()) > max_chars:
+        removable_index = next(
+            (
+                index
+                for index, (_, droppable) in enumerate(groups[:-1])
+                if droppable and index != 0
+            ),
+            None,
+        )
+        if removable_index is None:
+            break
+        groups.pop(removable_index)
+        dropped = True
+
+    return render()
+
+
+def _compact_history_message(message: Message, max_chars: int) -> Message:
+    compact = _sanitize_message(message)
+    if message.get("role") == "assistant" and message.get("tool_calls"):
+        compact_calls: list[dict[str, Any]] = []
+        for raw_call in message.get("tool_calls", []):
+            if not isinstance(raw_call, dict):
+                continue
+            call = dict(raw_call)
+            function = call.get("function")
+            if isinstance(function, dict):
+                function = dict(function)
+                raw_arguments = function.get("arguments", "{}")
+                try:
+                    arguments = json.loads(str(raw_arguments))
+                except (json.JSONDecodeError, TypeError):
+                    function["arguments"] = "{}"
+                else:
+                    if isinstance(arguments, dict):
+                        function["arguments"] = json.dumps(
+                            summarize_tool_arguments(arguments),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                call["function"] = function
+            compact_calls.append(call)
+        compact["tool_calls"] = compact_calls
+        content = str(compact.get("content") or "")
+        compact["content"] = _truncate_context_text(content, max_chars) or None
+        return compact
+
+    content = str(compact.get("content") or "")
+    if message.get("role") == "assistant":
+        parsed = parse_tool_response(content)
+        if parsed.calls:
+            visible = strip_tool_blocks(content).strip()
+            call_summary = ", ".join(
+                f"{call.name}("
+                + json.dumps(
+                    summarize_tool_arguments(call.arguments),
+                    ensure_ascii=False,
+                )
+                + ")"
+                for call in parsed.calls
+            )
+            content = "\n".join(
+                part for part in [visible, f"Earlier tool calls: {call_summary}"] if part
+            )
+    compact["content"] = _truncate_context_text(content, max_chars)
+    return compact
+
+
+def _truncate_context_text(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(text) <= max_chars:
+        return text
+    marker = f"\n... {len(text) - max_chars} characters omitted from older context ...\n"
+    if max_chars <= len(marker) + 1:
+        return text[:max_chars]
+    head_size = max(max_chars - len(marker) - 300, 1)
+    tail_size = max(0, min(300, max_chars - head_size - len(marker)))
+    return text[:head_size].rstrip() + marker + (text[-tail_size:] if tail_size else "")
+
+
+def _message_chars(messages: list[Message]) -> int:
+    return len(json.dumps(messages, ensure_ascii=False, separators=(",", ":")))
+
+
+def _limit_tool_feedback(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    marker = "\n...truncated..."
+    if max_chars <= len(marker):
+        return marker.strip()[:max_chars]
+    return text[: max_chars - len(marker)].rstrip() + marker
 
 
 def parse_tool_calls(text: str) -> list[ToolCall]:
@@ -416,26 +1382,48 @@ def parse_tool_calls(text: str) -> list[ToolCall]:
 
 def parse_tool_response(text: str) -> ToolParseResult:
     result = ToolParseResult()
+    candidates: list[tuple[int, int, ToolCall]] = []
+    candidate_order = 0
     raw_content_spans: list[tuple[int, int]] = []
+    inline_tool_spans: list[tuple[int, int]] = []
     for pattern in RAW_CONTENT_TOOL_BLOCK_PATTERNS:
         for match in pattern.finditer(text):
             if _span_overlaps(match.span(), raw_content_spans):
                 continue
             raw_content_spans.append(match.span())
             try:
-                result.calls.append(
-                    parse_raw_content_tool_call(match.group("header"), match.group("content"))
+                candidates.append(
+                    (
+                        match.start(),
+                        candidate_order,
+                        parse_raw_content_tool_call(
+                            match.group("header"), match.group("content")
+                        ),
+                    )
                 )
+                candidate_order += 1
             except ValueError as exc:
                 result.errors.append(ToolParseError(payload=match.group(0), error=str(exc)))
+    for match in LABELED_INLINE_TOOL_CALL_PATTERN.finditer(text):
+        if _span_overlaps(match.span(), raw_content_spans):
+            continue
+        inline_tool_spans.append(match.span())
+        payload = match.group("payload")
+        parsed_payload = parse_inline_tool_call(payload)
+        if isinstance(parsed_payload, ToolCall):
+            candidates.append((match.start(), candidate_order, parsed_payload))
+            candidate_order += 1
+        else:
+            result.errors.append(ToolParseError(payload=payload, error=str(parsed_payload)))
     for pattern in TOOL_BLOCK_PATTERNS:
         for match in pattern.finditer(text):
-            if _span_overlaps(match.span(), raw_content_spans):
+            if _span_overlaps(match.span(), [*raw_content_spans, *inline_tool_spans]):
                 continue
             payload = match.group(1).strip()
             parsed_payload = parse_tool_block_payload(payload)
             if isinstance(parsed_payload, ToolCall):
-                result.calls.append(parsed_payload)
+                candidates.append((match.start(), candidate_order, parsed_payload))
+                candidate_order += 1
                 continue
             if isinstance(parsed_payload, ValueError):
                 result.errors.append(ToolParseError(payload=payload, error=str(parsed_payload)))
@@ -446,7 +1434,8 @@ def parse_tool_response(text: str) -> ToolParseResult:
         if fragment.error:
             recovered = parse_recoverable_gemma_content_tool(fragment)
             if recovered is not None:
-                result.calls.append(recovered)
+                candidates.append((fragment.span[0], candidate_order, recovered))
+                candidate_order += 1
                 continue
             result.errors.append(ToolParseError(payload=fragment.raw, error=fragment.error))
             continue
@@ -456,12 +1445,28 @@ def parse_tool_response(text: str) -> ToolParseResult:
         except ValueError as exc:
             recovered = parse_recoverable_gemma_content_tool(fragment)
             if recovered is not None:
-                result.calls.append(recovered)
+                candidates.append((fragment.span[0], candidate_order, recovered))
+                candidate_order += 1
                 continue
             result.errors.append(ToolParseError(payload=fragment.raw, error=str(exc)))
             continue
-        result.calls.append(normalize_tool_call(fragment.name, arguments))
-    result.calls = [normalize_tool_call(call.name, call.arguments) for call in result.calls]
+        candidates.append(
+            (
+                fragment.span[0],
+                candidate_order,
+                normalize_tool_call(fragment.name, arguments),
+            )
+        )
+        candidate_order += 1
+
+    seen: set[str] = set()
+    for _, _, call in sorted(candidates, key=lambda item: (item[0], item[1])):
+        normalized = normalize_tool_call(call.name, call.arguments)
+        signature = _tool_call_signature(normalized)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        result.calls.append(normalized)
     return result
 
 
@@ -492,6 +1497,51 @@ def parse_tool_block_payload(payload: str) -> ToolCall | ValueError:
     if not isinstance(arguments, dict):
         return ValueError("Tool JSON `arguments` must be an object.")
     return normalize_tool_call(name, arguments)
+
+
+def parse_inline_tool_call(payload: str) -> ToolCall | ValueError:
+    try:
+        expression = ast.parse(payload, mode="eval").body
+    except SyntaxError as exc:
+        return ValueError(f"Invalid inline tool call: {exc.msg}.")
+    if not isinstance(expression, ast.Call) or not isinstance(expression.func, ast.Name):
+        return ValueError("Inline tool call must use name(key=value) syntax.")
+    if expression.args:
+        if len(expression.args) != 1 or expression.keywords:
+            return ValueError(
+                "Inline tool call must use key=value arguments or one argument object."
+            )
+        try:
+            positional_arguments = ast.literal_eval(expression.args[0])
+        except (ValueError, TypeError):
+            return ValueError("Inline tool call argument object must contain literal values.")
+        if not isinstance(positional_arguments, dict) or not all(
+            isinstance(key, str) for key in positional_arguments
+        ):
+            return ValueError("Inline tool call argument must be an object with string keys.")
+        return normalize_tool_call(expression.func.id, positional_arguments)
+
+    arguments: dict[str, Any] = {}
+    for keyword in expression.keywords:
+        if keyword.arg is None:
+            return ValueError("Inline tool calls do not support expanded **arguments.")
+        try:
+            value = ast.literal_eval(keyword.value)
+        except (ValueError, TypeError):
+            if isinstance(keyword.value, ast.Name) and keyword.value.id.lower() in {
+                "false",
+                "null",
+                "true",
+            }:
+                value = {"false": False, "null": None, "true": True}[
+                    keyword.value.id.lower()
+                ]
+            else:
+                return ValueError(
+                    f"Inline tool argument {keyword.arg!r} must be a literal value."
+                )
+        arguments[keyword.arg] = value
+    return normalize_tool_call(expression.func.id, arguments)
 
 
 def normalize_tool_call(name: str, arguments: dict[str, Any]) -> ToolCall:
@@ -1206,25 +2256,60 @@ def format_tool_parse_errors(errors: list[ToolParseError]) -> str:
     return "\n\n".join(rendered)
 
 
-def find_unverified_file_claims(text: str, workspace: Path) -> list[UnverifiedFileClaim]:
+def find_unverified_file_claims(
+    text: str,
+    workspace: Path,
+    *,
+    dry_run: bool = False,
+    known_paths: Iterable[Path] = (),
+    known_directories: Iterable[Path] = (),
+) -> list[UnverifiedFileClaim]:
     claims: list[UnverifiedFileClaim] = []
     resolved_workspace = workspace.resolve(strict=False)
+    resolved_known_paths = {
+        path.expanduser().resolve(strict=False) for path in known_paths
+    }
+    resolved_known_directories = {
+        path.expanduser().resolve(strict=False) for path in known_directories
+    }
     for unit in _claim_units(strip_tool_blocks(text)):
         for match in PATH_CLAIM_PATTERN.finditer(unit):
             raw_path = (match.group(1) or match.group(2) or "").strip()
             if not _looks_like_claimed_path(raw_path):
                 continue
-            verb = _nearest_claim_verb(unit, match.start())
+            verb = _nearest_claim_verb(
+                unit,
+                match.start(),
+                pattern=DRY_RUN_VERB_PATTERN if dry_run else VERB_PATTERN,
+            )
             claims_existing_path = verb is not None or _has_existence_claim_phrase(
                 unit,
                 match.start(),
             )
             if not claims_existing_path:
                 continue
-            path = _resolve_claim_path(raw_path, resolved_workspace)
+            candidates = _claim_path_candidates(
+                raw_path,
+                resolved_workspace,
+                known_paths=resolved_known_paths,
+                known_directories=resolved_known_directories,
+            )
+            path = candidates[0]
             display = _display_claim_path(path, resolved_workspace)
+            if dry_run and verb is not None:
+                claims.append(
+                    UnverifiedFileClaim(
+                        path=display,
+                        expected="preview only",
+                        reason=(
+                            "dry-run mode previewed this mutation but the answer claimed "
+                            "it had already happened"
+                        ),
+                    )
+                )
+                continue
             if verb in DELETE_VERBS:
-                if path.exists():
+                if any(candidate.exists() for candidate in candidates):
                     claims.append(
                         UnverifiedFileClaim(
                             path=display,
@@ -1232,7 +2317,7 @@ def find_unverified_file_claims(text: str, workspace: Path) -> list[UnverifiedFi
                             reason="the answer claimed this path was removed, but it still exists",
                         )
                     )
-            elif not path.exists():
+            elif not any(candidate.exists() for candidate in candidates):
                 claims.append(
                     UnverifiedFileClaim(
                         path=display,
@@ -1261,8 +2346,13 @@ def _claim_units(text: str) -> list[str]:
     ]
 
 
-def _nearest_claim_verb(unit: str, path_start: int) -> str | None:
-    verbs = list(VERB_PATTERN.finditer(unit[:path_start]))
+def _nearest_claim_verb(
+    unit: str,
+    path_start: int,
+    *,
+    pattern: re.Pattern[str] = VERB_PATTERN,
+) -> str | None:
+    verbs = list(pattern.finditer(unit[:path_start]))
     if not verbs:
         return None
     return verbs[-1].group(1).lower()
@@ -1287,6 +2377,29 @@ def _resolve_claim_path(raw_path: str, workspace: Path) -> Path:
     return path.resolve(strict=False)
 
 
+def _claim_path_candidates(
+    raw_path: str,
+    workspace: Path,
+    *,
+    known_paths: set[Path],
+    known_directories: set[Path],
+) -> list[Path]:
+    primary = _resolve_claim_path(raw_path, workspace)
+    candidates = [primary]
+    raw = Path(raw_path).expanduser()
+    if raw.is_absolute() or raw.parent != Path(".") or raw_path.startswith((".", "~")):
+        return candidates
+
+    for path in sorted(known_paths, key=str):
+        if path.name == raw.name and path not in candidates:
+            candidates.append(path)
+    for directory in sorted(known_directories, key=str):
+        candidate = (directory / raw).resolve(strict=False)
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
 def _display_claim_path(path: Path, workspace: Path) -> str:
     try:
         return str(path.relative_to(workspace))
@@ -1298,6 +2411,7 @@ def strip_tool_blocks(text: str) -> str:
     cleaned = text
     for pattern in RAW_CONTENT_TOOL_BLOCK_PATTERNS:
         cleaned = pattern.sub("", cleaned)
+    cleaned = LABELED_INLINE_TOOL_CALL_PATTERN.sub("", cleaned)
     for pattern in TOOL_BLOCK_PATTERNS:
         cleaned = pattern.sub("", cleaned)
     return strip_gemma_tool_fragments(cleaned)

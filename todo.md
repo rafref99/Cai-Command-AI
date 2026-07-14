@@ -5,25 +5,16 @@ not by commitment or release date.
 
 ## Now: Reliability and Correctness
 
-- [ ] **Preserve native tool-call protocol end to end.**
-  Keep provider tool-call IDs and send assistant `tool_calls` plus `tool` result
-  messages back in their native form. Retain fenced blocks as a compatibility
-  fallback for local and command-backed models.
-
 - [ ] **Make cancellation process-safe.**
-  Ensure `Ctrl-C` cancels provider requests, command adapters, local runner
-  startup, and shell commands without leaving child processes behind. Add
-  process-group cleanup tests.
+  Shell commands, command adapters, and local runner startup now use isolated
+  process groups with timeout/interruption cleanup and POSIX descendant tests.
+  Add explicit HTTP streaming cancellation tests and Windows process-tree CI
+  coverage.
 
 - [ ] **Add provider retry and error policies.**
   Handle rate limits, transient server errors, malformed streaming events, and
   connection resets with bounded retries and readable diagnostics. Never retry
   a local tool action automatically.
-
-- [ ] **Introduce context-window budgeting.**
-  Estimate conversation size, compact older tool output, and warn before a
-  provider limit is reached. Preserve recent edits, failures, and user decisions
-  during compaction.
 
 - [ ] **Use one source of truth for tool definitions.**
   Generate native schemas, prompt documentation, `/tools` output, validation,
@@ -31,13 +22,14 @@ not by commitment or release date.
   and provider schemas from drifting apart.
 
 - [ ] **Validate all tool arguments before execution.**
-  Apply consistent type, range, required-field, and unknown-field validation.
-  Return concise repair guidance that includes the accepted argument shape.
+  Reject unknown fields consistently and generate concise accepted-shape repair
+  guidance from shared metadata. Required fields and bounded scalar types are
+  already checked at runtime.
 
 - [ ] **Harden filesystem writes against edge cases.**
   Define limits for new file content, preserve newline and encoding behavior,
-  fsync parent directories after atomic replacement, and audit symlink and
-  time-of-check/time-of-use handling.
+  fsync parent directories after atomic replacement, and close remaining
+  time-of-check/time-of-use gaps under concurrent changes.
 
 ## Next: Editing and Model Effectiveness
 
@@ -61,22 +53,24 @@ not by commitment or release date.
   overrides.
 
 - [ ] **Build a tool-use evaluation suite.**
-  Replay representative responses from Gemma-style, standard JSON, native,
-  malformed, and small local models. Track parse success, repair rounds, edit
-  accuracy, context usage, and accidental duplicate actions.
+  Turn the existing Gemma, JSON, native, malformed, and small-model regressions
+  into a replayable fixture corpus. Track parse success, repair rounds, edit
+  accuracy, context usage, and accidental duplicate actions over time.
 
 - [ ] **Detect duplicate and stale edits.**
-  Assign tool-call IDs, recognize repeated calls after provider retries, and
-  reject line-based edits when the underlying file changed since it was read.
+  Recognize already-successful calls repeated after provider retries, and attach
+  file-version evidence to line-based edits so changes made between read and
+  write are rejected. Same-response path aliases and unchanged failed retries
+  are already guarded.
 
 - [ ] **Add transactional edit groups.**
   Let a task preview several related file operations and apply or roll them back
   as one unit. Include moves, deletions, and newly created files in checkpoints.
 
 - [ ] **Improve large-workspace performance.**
-  Stream directory traversal, paginate tool results, avoid building complete
-  file lists in memory, and optionally use `rg` when available with a Python
-  fallback.
+  Add an optional `rg` fast path with a Python fallback, then benchmark traversal
+  and search memory on large repositories. Directory walking and result paging
+  are already streamed and bounded.
 
 ## Next: User Workflows
 
@@ -93,50 +87,25 @@ not by commitment or release date.
   Summarize created, modified, moved, and deleted paths; show a consolidated
   diff; and make unresolved tool errors visible before the session closes.
 
-- [ ] **Support named configuration profiles.**
-  Allow commands such as `cai chat --profile local-gemma` for reusable provider,
-  model, timeout, and tool settings without duplicating config files.
-
 ## Next: Terminal Design and CLI Modernization
 
 - [ ] **Adopt a Codex-like interaction hierarchy.**
-  Keep the prompt and final answer visually dominant while presenting reasoning
-  phases, tool calls, approvals, and verification as a compact activity feed.
-  Avoid drawing a full bordered panel around every message.
-
-- [ ] **Create a low-noise tool activity view.**
-  Show concise entries such as `Read`, `Edit`, `Search`, and `Run`, with aligned
-  paths, elapsed time, success state, and optional expansion for full output.
-  Collapse repetitive reads and successful no-op actions.
-
-- [ ] **Modernize diff and approval rendering.**
-  Add syntax-aware inline diffs, clear file headers, change counts, and a stable
-  single-line confirmation prompt. Support approve once, approve similar actions
-  for the session, reject, and inspect full details.
+  The default line-oriented renderer is now borderless and keeps final answers
+  visually dominant. Continue refining intermediate reasoning and verification
+  grouping with real hosted and local-model sessions.
 
 - [ ] **Build a responsive terminal renderer.**
-  Handle narrow windows, terminal resizing, long paths, Unicode width, pasted
-  content, and non-TTY output without broken borders, cursor jumps, or clipped
-  text. Keep a plain ASCII fallback.
-
-- [ ] **Improve the interactive input composer.**
-  Support multi-line prompts, history search, reliable large pastes, slash-command
-  completion, path completion, and configurable key bindings without requiring a
-  full-screen interface.
+  Width-aware wrapping, middle-truncated paths, Unicode display width, resizing
+  between output events, non-TTY behavior, ASCII fallback, bracketed paste, and
+  a deterministic ASCII snapshot are in place. Add snapshot coverage on Windows
+  and representative Linux terminal environments.
 
 - [ ] **Add modern session commands.**
-  Consider `/status`, `/model`, `/provider`, `/permissions`, `/diff`, `/context`,
-  and `/compact` so users can inspect or adjust a session without restarting it.
-  Keep `/help` generated from the same command registry.
-
-- [ ] **Add terminal capability and accessibility settings.**
-  Detect color, hyperlinks, Unicode, and interactive capabilities. Provide
-  semantic themes, high-contrast output, `NO_COLOR` support, and screen-reader-
-  friendly plain output.
-
-- [ ] **Add progress and usage reporting.**
-  Show unobtrusive elapsed time and optional token/context usage when providers
-  expose it. Avoid animated output in logs, pipes, tests, or reduced-motion mode.
+  `/status`, `/model`, `/provider`, `/permissions`, `/context`, and Markdown
+  `/export` are available, `/diff` provides a bounded Git workspace review, and
+  `/compact` preserves the transcript behind a local context summary. `/help`
+  is generated from the command registry, and `/model NAME` safely changes the
+  active model. Support safe session-time provider changes.
 
 - [ ] **Offer an optional full-screen TUI.**
   Explore a split view for conversation, current plan, changed files, and command
@@ -144,19 +113,9 @@ not by commitment or release date.
   dependency-free fallback.
 
 - [ ] **Improve command-line ergonomics.**
-  Add `--version`, shell completion, `--prompt-file`, consistent short flags,
-  stable machine-readable errors, and an option to write the final answer to a
-  specified path.
-
-- [ ] **Make first-run setup shorter.**
-  Provide sensible hosted/local presets, detect reachable local servers, preview
-  the resolved configuration, and separate essential questions from advanced
-  safety and performance settings.
-
-- [ ] **Add a deterministic demo and screenshot mode.**
-  Replay a safe fake-provider session with normalized paths, stable dimensions,
-  and no personal data so documentation images and terminal snapshots can be
-  regenerated after design changes.
+  `--version`, `--prompt-file`, `--output`, and short model/workspace/prompt/output
+  flags, shell completion, and stable machine-readable errors are available.
+  Audit remaining flags for consistent short forms.
 
 ## Later: Extensibility and Code Intelligence
 
@@ -208,8 +167,9 @@ not by commitment or release date.
   handling, workspace escape protections, and the guarantees of approval mode.
 
 - [ ] **Complete release metadata.**
-  Add a license, project URLs, maintainer information, a changelog, and a single
-  version source shared by the package and `pyproject.toml`.
+  Declare the existing license in package metadata, add project URLs, maintainer
+  information, and a changelog. Package and build metadata now share one dynamic
+  version source.
 
 - [ ] **Automate releases.**
   Build and validate wheels and source distributions, run package smoke tests,
