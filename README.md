@@ -7,6 +7,8 @@ shell access inside a controlled workspace.
 > Cai is alpha software. Review requested actions and keep important work under
 > version control.
 
+> **Project credit:** This entire project was coded using Codex and ChatGPT 5.6 Sol.
+
 ![preview](./preview.png)
 
 

@@ -39,6 +39,8 @@ pip-wheel-metadata/
 *.log
 .cai/
 .cai-snapshots/
+testing/
+
 
 # Local model weights
 *.gguf
