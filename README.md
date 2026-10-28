@@ -1,212 +1,100 @@
-# Cai
+![Cai terminal interface](docs/preview.png)
 
-Cai 1.1.2 is a lightweight terminal coding agent for hosted APIs and local
-models. It can inspect, edit, and validate a project while keeping file and
-shell access inside a controlled workspace.
+# Cai — Command AI
 
-> Cai is alpha software. Review requested actions and keep important work under
-> version control.
+A terminal assistant for working with files and running programs, powered by models
+on your own hardware. Cai connects to **Ollama, LM Studio, or llama.cpp** on the same
+computer or an explicitly configured private LAN server. There is no hosted-model fallback.
 
-> **Project credit:** This entire project was coded using Codex and ChatGPT 5.6 Sol.
+**Status: alpha.** Tool use and task completion depend on the model, its chat template,
+and the resources available to the model server. Cai reports failures and verifies
+individual file operations, but it cannot guarantee that an entire task is correct.
 
-![preview](./preview.png)
+## What Cai can do
 
+- Discover available local models and validate active context settings during setup.
+- Support context windows of **65,536 tokens and larger**.
+- List and search workspace files, read and edit UTF-8 text, and organize directories.
+- Run approved programs with explicit arguments, bounded output, and timeouts.
+- Verify written/copied file contents and check the path state after other file changes.
+- Show numbered conversation turns, explicit approval decisions, and useful error details.
+- Track unresolved tool failures and stop repeated calls or unchanged inspection cycles.
 
-## Features
+Web search, image input, document-format adapters, persistent sessions, automatic undo,
+and messaging integrations are planned. See the [improvement roadmap](docs/IMPROVEMENTS.md)
+for implemented work, planned features, and their expected performance tradeoffs.
 
-- Interactive sessions with `cai chat` and scriptable one-shot tasks with
-  `cai once`.
-- Hosted and local OpenAI-compatible APIs, local model files, and command-based
-  provider adapters.
-- Native function calling when supported, plus resilient textual tool-call
-  parsing for local models such as Gemma.
-- File inspection, search, precise editing, workspace review, Python checks,
-  and shell commands.
-- Per-action or session approvals, dry-run previews, optional snapshots, and
-  workspace boundaries.
-- Compact `Thinking`, `Working`, tool activity, and `Done` output with
-  elapsed time and provider token usage when available.
-- Configuration profiles, transcript export, shell completion, themes, and
-  accessible plain-terminal output.
-- No third-party runtime dependencies; Python 3.10 or newer is required.
+## Quick start
 
-## Installation
+You need Python 3.10+, a running supported model server, and a tool-capable model
+with at least 65,536 context tokens. Allow enough memory for both the model and its
+context allocation. For LM Studio and llama.cpp, load the model with that allocation
+before setup. LM Studio must expose `/api/v1/models`.
 
-From the project directory:
+From the root of this repository on macOS or Linux:
 
-```bash
-python3 -m pip install -e .
-cai --version
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/cai setup
+.venv/bin/cai
 ```
 
-You can also run the package without installing the `cai` command:
+Setup discovers models, checks context settings, and probes structured tool calling
+without executing the generated call. Settings are saved in `~/.cai/local.json`.
+The editable installation uses this checkout, so keep the repository in place.
 
-```bash
-python3 -m cai --help
+For Windows instructions, provider selection, or a model hosted on another computer,
+see the [user guide](docs/USAGE.md).
+
+## Use Cai
+
+After activation or [adding Cai to PATH](docs/USAGE.md#make-cai-available-from-any-directory):
+
+```sh
+cai
+cai chat --workspace ~/Documents/example
+cai once "List the files and summarize their organization."
+cai once --dry-run "Create notes.txt with a short checklist."
+cai --timeout 900
 ```
 
-## Quick Start
+Paste a multiline request and press Enter to submit it. Ctrl-C interrupts running
+work. Completed file changes remain in place after cancellation or failure.
 
-Create a configuration, check it, and start chatting:
-
-```bash
-cai setup
-cai doctor
-cai chat
-```
-
-For a shorter setup flow, select a hosted or common local provider:
-
-```bash
-cai setup --quick lm-studio --model "<model-name>"
-cai setup --quick ollama --model "<model-name>"
-cai setup --quick hosted --model "<model-name>"
-cai setup --quick auto --model "<model-name>"
-```
-
-`--quick auto` selects the first reachable built-in localhost endpoint. The
-full `cai setup` wizard supports custom URLs, command adapters, local model
-files, and advanced safety settings.
-
-Run a single task and exit:
-
-```bash
-cai once "Inspect this project and run the most relevant tests."
-cai once --prompt-file task.md --output answer.md
-cai once --output-format json "Summarize the workspace."
-```
-
-Chat and one-shot commands use the launch directory as the workspace unless
-`--workspace PATH` or `CAI_WORKSPACE` is set.
-
-## Providers
-
-### Hosted OpenAI-Compatible API
-
-```bash
-export OPENAI_API_KEY="..."
-
-cai chat \
-  --base-url https://api.openai.com/v1 \
-  --api-key-env OPENAI_API_KEY \
-  --model "<model-name>" \
-  --native-tools
-```
-
-### Local API Server
-
-Cai includes presets for LM Studio, Ollama, llama.cpp, vLLM, and
-text-generation-webui:
-
-```bash
-cai presets
-cai chat --preset lm-studio --model "<model-name>"
-```
-
-For a custom endpoint:
-
-```bash
-cai chat \
-  --base-url http://127.0.0.1:1234/v1 \
-  --model "<model-name>"
-```
-
-Use `--native-tools` only when the endpoint and model support structured
-function calling. Cai otherwise uses its text-tool compatibility layer.
-
-Local model files and command adapters are documented in the
-[Operating Guide](OPERATING.md#choose-a-provider).
-
-## Configuration Profiles
-
-The default configuration is stored in `~/.cai/config.json`; named profiles
-are stored in `~/.cai/profiles/`.
-
-```bash
-cai setup --profile local
-cai setup --profile hosted
-cai profiles list
-cai profiles use local
-cai chat --profile hosted
-```
-
-Use environment variables for API keys. Profile selection priority is:
-`--profile`, `CAI_PROFILE`, the profile selected by `cai profiles use`,
-then `default`.
-
-## Interactive Commands
-
-Enter `/help` during `cai chat` to see all session commands.
-
-| Command | Purpose |
+| Chat command | Purpose |
 | --- | --- |
-| `/status`, `/context`, `/permissions` | Inspect session state, context usage, and safety policy. |
-| `/model [NAME]`, `/provider`, `/config` | Inspect or change model and provider settings. |
-| `/pwd`, `/cd PATH` | Inspect or change the active workspace. |
-| `/diff` | Review tracked and untracked workspace changes. |
-| `/activity [N\|all]`, `/tools` | Inspect recent tool calls and available tools. |
-| `/compact`, `/clear` | Reduce model context or clear conversation history. |
-| `/thinking` | Toggle raw visible model output while it is generated. |
-| `/export [PATH]` | Export the current conversation to Markdown. |
-| `/help`, `/exit` | Show help or end the session. |
+| `/task` | Show operation counts and unresolved failures for the latest task. |
+| `/context` | Show the context budget and latest input estimate. |
+| `/clear` | Clear conversation history and the current task record. |
+| `/stop` or `/cancel` | Discard queued input at the prompt. |
+| `/exit` or `/quit` | End the session. |
 
-Raw output shown by `/thinking` may include textual tool syntax from local
-models. Leave it off for the cleanest interface.
+## Permissions and data
 
-## Safety and Approvals
+File changes require approval; file permissions may be granted for the current
+session. Every program invocation requires separate approval. Dry runs preview
+actions without applying them.
 
-By default:
+File tools enforce workspace boundaries. Approved programs run with your ordinary
+OS permissions and can access files and the network: the workspace is **not a
+process sandbox**. Automatic rollback is not implemented.
 
-- File tools stay inside the active workspace.
-- Writes, moves, deletions, and shell commands require approval.
-- `--dry-run` previews mutations without applying them.
-- `--snapshot-dir PATH` preserves existing files before modification.
-- `Ctrl-C` interrupts model work without closing an interactive session.
-
-Approval choices are:
-
-- `y`: approve this action once.
-- `a`: approve similar actions for the current session.
-- `d`: inspect the full command or diff.
-- `n` or Enter: reject the action.
-
-Use `--yes` only in a trusted workspace.
-
-## Main CLI Commands
-
-| Command | Purpose |
-| --- | --- |
-| `cai setup` | Create or update a configuration profile. |
-| `cai config` | Inspect or change saved configuration values. |
-| `cai profiles` | Create, list, select, or delete profiles. |
-| `cai doctor` | Check provider, model, workspace, and runner settings. |
-| `cai presets` | List built-in local-provider presets. |
-| `cai chat` | Start an interactive session. |
-| `cai once` | Run one task and exit. |
-| `cai completion SHELL` | Print Bash, Zsh, or Fish completion. |
-| `cai demo` | Render a deterministic terminal-interface demo. |
-
-Run `cai <command> --help` for every option.
-
-## Terminal Controls
-
-```bash
-cai --theme high-contrast chat
-cai --theme monochrome chat
-cai --ascii chat
-cai --key-bindings vi chat
-eval "$(cai completion zsh)"
-```
-
-Related environment variables include `CAI_THEME`, `CAI_KEY_BINDINGS`,
-`CAI_REDUCED_MOTION`, `CAI_PLAIN`, and `NO_COLOR`. Use
-`--no-hyperlinks` when terminal file links are not wanted.
+Model connections default to localhost. Private LAN connections require explicit
+setup; prompts and relevant tool results then travel to the selected server while
+tools still execute on the computer running Cai. API tokens are read from a named
+environment variable, not stored in Cai's configuration. Redirects and inherited
+HTTP proxies are disabled. HTTP traffic is unencrypted; HTTPS uses certificate
+verification. The model server is trusted software and must itself run inference locally.
 
 ## Documentation
 
-- [Operating Guide](OPERATING.md) — setup, providers, configuration, scripting,
-  and troubleshooting.
-- [Feature Reference](FEATURES.md) — tools, safety behavior, and model
-  compatibility.
-- [Contributing Guide](CONTRIBUTING.md) — development setup and validation.
-- [License](LICENSE).
+- [Installation, PATH setup, configuration, and troubleshooting](docs/USAGE.md)
+- [Removing the command and uninstalling Cai](docs/USAGE.md#removing-cai)
+- [Improvement roadmap and speed tradeoffs](docs/IMPROVEMENTS.md)
+- [Architecture and project direction](docs/REMAKE.md)
+- [Contributing and development checks](CONTRIBUTING.md)
+
+## License
+
+[MIT](LICENSE).

@@ -6,9 +6,6 @@ import sys
 import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
-
-from . import __version__
 
 COLORS = {
     "reset": "\033[0m",
@@ -44,26 +41,6 @@ THEME_ALIASES = {
     "monochrome": {},
 }
 
-TOOL_LABELS = {
-    "list_files": "List",
-    "file_info": "Inspect",
-    "read_file": "Read",
-    "create_dir": "Create",
-    "write_file": "Write",
-    "append_file": "Edit",
-    "insert_lines": "Edit",
-    "replace_lines": "Edit",
-    "replace_text": "Edit",
-    "python_symbols": "Inspect",
-    "replace_symbol": "Edit",
-    "copy_file": "Copy",
-    "move_path": "Move",
-    "delete_path": "Delete",
-    "search": "Search",
-    "python_syntax_check": "Check",
-    "run_shell": "Run",
-}
-
 
 @dataclass(frozen=True)
 class TerminalCapabilities:
@@ -72,16 +49,6 @@ class TerminalCapabilities:
     unicode: bool
     hyperlinks: bool
     reduced_motion: bool
-
-
-@dataclass(frozen=True)
-class ToolActivityRecord:
-    label: str
-    detail: str
-    result: str
-    ok: bool
-    elapsed: float
-    no_op: bool = False
 
 
 @dataclass
@@ -98,24 +65,12 @@ class TerminalUI:
         default_factory=set,
         repr=False,
     )
-    _tool_activity_log: list[ToolActivityRecord] = field(
-        init=False,
-        default_factory=list,
-        repr=False,
-    )
-    _tool_group_label: str = field(init=False, default="", repr=False)
-    _tool_group_count: int = field(init=False, default=0, repr=False)
-    _tool_group_elapsed: float = field(init=False, default=0.0, repr=False)
-    _tool_group_first_detail: str = field(init=False, default="", repr=False)
-    _tool_group_last_detail: str = field(init=False, default="", repr=False)
     _workspace: Path | None = field(init=False, default=None, repr=False)
     _last_status_phase: str = field(init=False, default="", repr=False)
 
     def __post_init__(self) -> None:
         interactive = (
-            bool(sys.stdout.isatty())
-            if self.force_terminal is None
-            else self.force_terminal
+            bool(sys.stdout.isatty()) if self.force_terminal is None else self.force_terminal
         )
         plain = os.environ.get("CAI_PLAIN") is not None
         selected_theme = (self.theme or os.environ.get("CAI_THEME", "default")).lower()
@@ -185,43 +140,7 @@ class TerminalUI:
         columns = self.fixed_width or shutil.get_terminal_size((96, 24)).columns
         return max(12, min(columns, 112))
 
-    def rule(self, title: str = "") -> None:
-        width = self.terminal_width()
-        if title:
-            label = f" {title} "
-            if _display_width(label) >= width:
-                print(self.color(_truncate_display(label.strip(), width), "gray"))
-                return
-            left = max((width - _display_width(label)) // 2, 0)
-            right = max(width - left - _display_width(label), 0)
-            line = ("-" * left) + label + ("-" * right)
-        else:
-            line = "-" * width
-        print(self.color(line, "gray"))
-
-    def header(self, *, model: str, profile: str, provider: str, workspace: str) -> None:
-        self._workspace = Path(workspace).expanduser().resolve(strict=False)
-        brand = self.color(f"Cai {__version__}", "bold")
-        model_label = model or "provider default"
-        separator = self.symbol(" · ", " | ")
-        print(brand)
-        self.print_wrapped(
-            f"{model_label}{separator}{provider}",
-            indent="  ",
-            color="gray",
-        )
-        workspace_target = self._workspace.as_uri()
-        self.print_wrapped(
-            f"{workspace}{separator}{profile}",
-            indent="  ",
-            color="gray",
-            hyperlink=workspace_target,
-        )
-        print(self.color("  /help for commands", "gray"))
-        print()
-
     def status(self, text: str) -> None:
-        self._flush_tool_group()
         if ":" in text:
             phase, _ = text.split(":", 1)
         else:
@@ -265,127 +184,12 @@ class TerminalUI:
         else:
             shown_label = _truncate_display(label, 8)
             prefix = f"  {icon} {shown_label:<8}"
-        suffix = (
-            f"  {_format_elapsed(elapsed)}"
-            if elapsed is not None and width >= 24
-            else ""
-        )
+        suffix = f"  {_format_elapsed(elapsed)}" if elapsed is not None and width >= 24 else ""
         available = max(width - _display_width(prefix) - len(suffix) - 1, 0)
         shown_detail = _truncate_display(" ".join(detail.split()), available)
         separator = " " if shown_detail else ""
         line = f"{prefix}{separator}{shown_detail}{suffix}".rstrip()
         print(self.color(line, colors.get(state, "cyan")))
-
-    def tool_activity(
-        self,
-        name: str,
-        arguments: dict[str, Any],
-        result: str,
-        *,
-        ok: bool,
-        elapsed: float,
-    ) -> None:
-        label = TOOL_LABELS.get(name, name.replace("_", " ").title())
-        detail = _tool_detail(name, arguments)
-        no_op = ok and _is_noop_result(result)
-        record = ToolActivityRecord(label, detail, result, ok, elapsed, no_op)
-        self._tool_activity_log.append(record)
-        if len(self._tool_activity_log) > 200:
-            del self._tool_activity_log[:-200]
-        if no_op:
-            return
-        if ok and label == self._tool_group_label:
-            self._tool_group_count += 1
-            self._tool_group_elapsed += elapsed
-            self._tool_group_last_detail = detail
-            return
-        self._flush_tool_group()
-        if ok:
-            self._tool_group_label = label
-            self._tool_group_count = 1
-            self._tool_group_elapsed = elapsed
-            self._tool_group_first_detail = detail
-            self._tool_group_last_detail = detail
-        self.activity(
-            label,
-            detail,
-            state="success" if ok else "error",
-            elapsed=elapsed,
-        )
-        if not ok:
-            self.print_wrapped(result, indent="      ", color="red")
-
-    def _flush_tool_group(self) -> None:
-        if self._tool_group_count > 1:
-            detail = f"{self._tool_group_count} operations"
-            if self._tool_group_first_detail == self._tool_group_last_detail:
-                detail += self.symbol(" · ", " | ") + self._tool_group_first_detail
-            elif self._tool_group_first_detail and self._tool_group_last_detail:
-                detail += (
-                    self.symbol(" · ", " | ")
-                    + self._tool_group_first_detail
-                    + self.symbol(" → ", " -> ")
-                    + self._tool_group_last_detail
-                )
-            self.activity(
-                self._tool_group_label,
-                detail,
-                state="success",
-                elapsed=self._tool_group_elapsed,
-            )
-        self._tool_group_label = ""
-        self._tool_group_count = 0
-        self._tool_group_elapsed = 0.0
-        self._tool_group_first_detail = ""
-        self._tool_group_last_detail = ""
-
-    def tool_activity_report(self, limit: int | None = 10) -> str:
-        self._flush_tool_group()
-        records = self._tool_activity_log if limit is None else self._tool_activity_log[-limit:]
-        if not records:
-            return "No tool activity yet."
-        omitted = len(self._tool_activity_log) - len(records)
-        lines = [f"({omitted} earlier entries omitted)"] if omitted else []
-        for index, record in enumerate(records, start=max(1, omitted + 1)):
-            state = "ok" if record.ok else "error"
-            if record.no_op:
-                state = "no change"
-            detail = (
-                self.symbol(f" — {record.detail}", f" - {record.detail}")
-                if record.detail
-                else ""
-            )
-            lines.append(
-                f"{index}. {record.label}{detail} [{state}, {_format_elapsed(record.elapsed)}]"
-            )
-            output = record.result.strip()
-            if output:
-                limited = output[:2_000]
-                if len(output) > len(limited):
-                    limited = limited.rstrip() + "\n... output truncated ..."
-                lines.extend(f"   {line}" for line in limited.splitlines())
-        return "\n".join(lines)
-
-    def stream_delta(self, text: str) -> None:
-        print(text, end="", flush=True)
-
-    def stream_end(self) -> None:
-        print()
-
-    def completion_summary(
-        self,
-        elapsed: float,
-        *,
-        input_tokens: int = 0,
-        output_tokens: int = 0,
-        context_chars: int = 0,
-    ) -> None:
-        details = [_format_elapsed(elapsed)]
-        if input_tokens or output_tokens:
-            details.append(f"{input_tokens:,} in / {output_tokens:,} out tokens")
-        elif context_chars:
-            details.append(f"{context_chars:,} context chars")
-        self.activity("Done", self.symbol(" · ", " | ").join(details), state="success")
 
     def info(self, text: str) -> None:
         self.notice("Info", text, "blue")
@@ -409,35 +213,58 @@ class TerminalUI:
         self.print_wrapped(body, indent="  ", color=color if color_body else None)
 
     def section(self, title: str, body: str, color: str = "cyan") -> None:
-        self._flush_tool_group()
         print(self.color(title, "bold" if color == "cyan" else color))
         self.print_wrapped(body)
 
-    def answer(self, body: str) -> None:
-        self._flush_tool_group()
-        print()
-        print(self.color("Answer", "green"))
-        self.print_wrapped(body)
-
-    def diff(self, title: str, body: str) -> None:
-        print(self.color(title, "bold"))
-        self._print_diff_lines(body)
-
     def panel(self, title: str, body: str, color: str = "cyan") -> None:
-        """Compatibility wrapper for extensions using the pre-0.2 UI API."""
+        """Display a labeled block of terminal output."""
         self.section(title, body, color)
 
-    def prompt(self) -> str:
-        self._flush_tool_group()
-        marker = self.input_color(self.symbol("› ", "> "), "green")
-        continuation = self.input_color("  ... ", "gray")
-        lines: list[str] = []
-        value = _normalize_pasted_input(input(marker))
-        while value.endswith("\\") and not value.endswith("\\\\"):
-            lines.append(value[:-1])
-            value = _normalize_pasted_input(input(continuation))
-        lines.append(value)
-        return "\n".join(lines)
+    def conversation_heading(self, label: str, color: str = "cyan") -> None:
+        width = self.terminal_width()
+        line = self.symbol("─", "-")
+        title = _truncate_display(f"{line}{line} {label} ", width)
+        print()
+        print(self.color(title + line * max(0, width - _display_width(title)), color))
+
+    def user_message(self, text: str) -> None:
+        self._turn_number = getattr(self, "_turn_number", 0) + 1
+        self._approval_number = 0
+        self._last_status_phase = ""
+        self.conversation_heading(f"YOU #{self._turn_number}", "blue")
+        # Preserve code and traceback indentation in the committed transcript.
+        for line in text.splitlines():
+            print(f"  {line}")
+        print()
+
+    def assistant_message(self, text: str, status: str) -> None:
+        label = "INCOMPLETE" if status == "incomplete" else "RESPONSE"
+        self.conversation_heading(
+            f"CAI #{getattr(self, '_turn_number', 0)} | {label}",
+            "yellow" if status == "incomplete" else "green",
+        )
+        print(text)
+        print()
+
+    def tool_status(self, name: str, status: str) -> None:
+        labels = {"ok": "complete", "error": "failed", "denied": "denied", "preview": "preview"}
+        color = "red" if status in {"error", "denied"} else "gray"
+        marker = self.symbol("·", "-")
+        separator = self.symbol("—", "-")
+        print(self.color(f"  {marker} {name.replace('_', ' ').capitalize()} {separator} "
+                         f"{labels.get(status, status)}", color))
+
+    def tool_error(self, detail: str) -> None:
+        # Output is untrusted: suppress terminal control characters, retain line breaks.
+        detail = "".join(char for char in detail
+                         if char in "\n\t" or not unicodedata.category(char).startswith("C"))
+        lines = detail.splitlines()
+        clipped = len(lines) > 12 or len(detail) > 2000
+        shown = "\n".join(lines[-12:])[-2000:]
+        if clipped:
+            print("    ... last error lines ...")
+        for line in shown.splitlines():
+            print(f"    {line.expandtabs(4)}")
 
     def approve(self, question: str) -> bool:
         action_kind = _approval_kind(question)
@@ -533,15 +360,6 @@ def _display_width(text: str) -> int:
     return width
 
 
-def _normalize_pasted_input(value: str) -> str:
-    return (
-        value.replace("\x1b[200~", "")
-        .replace("\x1b[201~", "")
-        .replace("\r\n", "\n")
-        .replace("\r", "\n")
-    )
-
-
 def _diff_language(diff_path: str) -> str:
     path = diff_path.split("\t", 1)[0]
     suffix = Path(path).suffix.lower()
@@ -590,8 +408,10 @@ def _take_display(text: str, width: int) -> str:
     result: list[str] = []
     used = 0
     for char in text:
-        char_width = 0 if unicodedata.combining(char) else (
-            2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1
+        char_width = (
+            0
+            if unicodedata.combining(char)
+            else (2 if unicodedata.east_asian_width(char) in {"W", "F"} else 1)
         )
         if used + char_width > width:
             break
@@ -624,30 +444,6 @@ def _format_elapsed(elapsed: float) -> str:
     if elapsed < 10:
         return f"{elapsed:.1f}s"
     return f"{elapsed:.0f}s"
-
-
-def _tool_detail(name: str, arguments: dict[str, Any]) -> str:
-    if name == "run_shell":
-        return str(arguments.get("command", "(command)"))
-    if name == "search":
-        pattern = str(arguments.get("pattern", ""))
-        path = str(arguments.get("path", "."))
-        return f"{pattern!r} in {path}"
-    if "path" in arguments:
-        path = str(arguments["path"])
-        if name == "read_file" and arguments.get("start_line"):
-            return f"{path}:{arguments['start_line']}"
-        return path
-    if "source" in arguments and "destination" in arguments:
-        return f"{arguments['source']} -> {arguments['destination']}"
-    if "source" in arguments:
-        return str(arguments["source"])
-    return ""
-
-
-def _is_noop_result(result: str) -> bool:
-    lowered = result.lstrip().lower()
-    return lowered.startswith(("no changes:", "directory already exists:", "path already absent:"))
 
 
 def _approval_kind(question: str) -> str:

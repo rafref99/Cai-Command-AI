@@ -5,14 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "cai"
 dynamic = ["version"]
-description = "Cai: a terminal coding agent for hosted APIs and local models."
+description = "Cai: a local-only terminal computer assistant."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["prompt-toolkit>=3.0.48,<4"]
 authors = [
   { name = "Cai contributors" }
 ]
-keywords = ["agent", "cli", "coding-assistant", "local-models", "openai-compatible"]
+keywords = ["agent", "cli", "terminal-assistant", "local-models", "openai-compatible"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
@@ -31,7 +31,7 @@ dev = [
 ]
 
 [project.scripts]
-cai = "cai.cli:main"
+cai = "cai.local.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["cai*"]

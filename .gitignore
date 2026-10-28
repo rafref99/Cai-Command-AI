@@ -39,7 +39,14 @@ pip-wheel-metadata/
 *.log
 .cai/
 .cai-snapshots/
-testing/
+# Private credentials and machine-specific exports
+*.pem
+*.p12
+*.pfx
+.ssh/
+.aws/
+scratch/
+node_modules/
 
 
 # Local model weights
